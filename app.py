@@ -117,6 +117,36 @@ st.markdown(
         background-color: #2563EB;
         color: white;
     }
+
+    div[data-testid="stFileUploader"] label {
+        color: #0F172A !important;
+        font-weight: 700 !important;
+        font-size: 16px !important;
+    }
+
+    div[data-testid="stFileUploader"] section {
+        background-color: #F8FAFC !important;
+        border: 2px dashed #2563EB !important;
+        border-radius: 14px !important;
+    }
+
+    div[data-testid="stFileUploader"] button {
+        color: #FFFFFF !important;
+        background-color: #2563EB !important;
+        border: 1px solid #2563EB !important;
+        font-weight: 700 !important;
+    }
+
+    div[data-testid="stFileUploader"] button:hover {
+        background-color: #1D4ED8 !important;
+        border-color: #1D4ED8 !important;
+        color: #FFFFFF !important;
+    }
+
+    div[data-testid="stFileUploader"] small {
+        color: #334155 !important;
+    }
+
     </style>
     """,
     unsafe_allow_html=True
@@ -1218,10 +1248,34 @@ display_hero()
 st.sidebar.markdown("## 📊 Smart EDA")
 st.sidebar.markdown("Upload a CSV or Excel file to start your analysis.")
 
-uploaded_file = st.sidebar.file_uploader(
+sidebar_uploaded_file = st.sidebar.file_uploader(
     "Upload CSV or Excel file",
-    type=["csv", "xlsx", "xls"]
+    type=["csv", "xlsx", "xls"],
+    key="sidebar_uploader"
 )
+
+main_uploaded_file = None
+
+if sidebar_uploaded_file is None:
+    st.markdown(
+        """
+        <div class="section-card">
+            <h3 style="color:#0F172A; font-weight:800;">📤 Upload your dataset</h3>
+            <p class="small-note" style="color:#334155; font-size:15px;">
+            If you are using a mobile device, use the upload button below to select your CSV or Excel file.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    main_uploaded_file = st.file_uploader(
+        "Upload CSV or Excel file",
+        type=["csv", "xlsx", "xls"],
+        key="main_uploader"
+    )
+
+uploaded_file = sidebar_uploaded_file if sidebar_uploaded_file is not None else main_uploaded_file
 
 st.sidebar.markdown("---")
 

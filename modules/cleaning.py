@@ -132,13 +132,18 @@ def apply_iterative_imputation(df, numeric_cols, max_iter=10, random_state=42):
     return df_out
 
 
-def create_multiple_imputed_zip(df, numeric_cols, n_datasets=5, max_iter=10, random_seed=42):
+def create_multiple_imputed_zip(
+    df, numeric_cols, n_datasets=5, max_iter=10, random_seed=42,
+    progress_callback=None,
+):
     usable = [c for c in numeric_cols if df[c].notna().sum() > 0]
     if not usable:
         return None
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for i in range(n_datasets):
+            if progress_callback:
+                progress_callback(i, n_datasets)
             df_imp = df.copy()
             imputer = IterativeImputer(
                 max_iter=max_iter, sample_posterior=True, random_state=random_seed + i
@@ -148,6 +153,8 @@ def create_multiple_imputed_zip(df, numeric_cols, n_datasets=5, max_iter=10, ran
                 f"imputed_dataset_{i + 1}.csv",
                 df_imp.to_csv(index=False).encode("utf-8"),
             )
+    if progress_callback:
+        progress_callback(n_datasets, n_datasets)
     buf.seek(0)
     return buf
 

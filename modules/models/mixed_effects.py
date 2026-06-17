@@ -25,16 +25,16 @@ from statsmodels.stats.stattools import durbin_watson
 
 def _show_issue(level, msg, fix=""):
     if level == "error":
-        st.error("RED: " + msg + ("\n\nFix: " + fix if fix else ""))
+        st.error("🔴 **" + msg + "**" + ("\n\n💡 *Fix:* " + fix if fix else ""))
     elif level == "warning":
-        st.warning("YELLOW: " + msg + ("\n\nFix: " + fix if fix else ""))
+        st.warning("🟡 **" + msg + "**" + ("\n\n💡 *Fix:* " + fix if fix else ""))
     else:
-        st.info("INFO: " + msg)
+        st.info("🔵 " + msg)
 
 
 def _diagnostic_summary(issues):
     if not issues:
-        st.success("All diagnostic checks passed - no major issues detected.")
+        st.success("✅ All diagnostic checks passed - no major issues detected.")
     else:
         for i in issues:
             _show_issue(i["level"], i["msg"], i.get("fix", ""))
@@ -216,7 +216,7 @@ def run_lme(df, outcome, fixed_effects, group_col, random_slopes, plot_template)
     st.dataframe(coef_tbl, use_container_width=True)
 
     st.download_button(
-        "Download fixed effects (CSV)",
+        "📥 Download fixed effects (CSV)",
         data=coef_tbl.to_csv(index=False).encode(),
         file_name="lme_fixed_effects.csv",
         mime="text/csv",
@@ -326,7 +326,7 @@ def run_lme(df, outcome, fixed_effects, group_col, random_slopes, plot_template)
         st.info("LR Test could not be performed: " + str(e))
 
     # ── Residual diagnostics ──────────────────────────────────
-    st.markdown("### Residual Diagnostics")
+    st.markdown("### 🔬 Residual Diagnostics")
     try:
         residuals = result.resid
         fitted    = result.fittedvalues
@@ -410,7 +410,7 @@ def run_lme(df, outcome, fixed_effects, group_col, random_slopes, plot_template)
         st.info("Residual diagnostics could not be fully generated: " + str(e))
 
     # ── Diagnostic summary ────────────────────────────────────
-    st.markdown("### Diagnostic Summary")
+    st.markdown("### 🩺 Diagnostic Summary")
     _diagnostic_summary(issues)
 
     with st.expander("Full Model Summary"):
@@ -533,7 +533,7 @@ def run_glme(df, outcome, fixed_effects, group_col, family_name, plot_template):
     st.dataframe(coef_tbl, use_container_width=True)
 
     st.download_button(
-        "Download GLME coefficients (CSV)",
+        "📥 Download GLME coefficients (CSV)",
         data=coef_tbl.to_csv(index=False).encode(),
         file_name="glme_coefficients.csv",
         mime="text/csv",
@@ -541,7 +541,7 @@ def run_glme(df, outcome, fixed_effects, group_col, family_name, plot_template):
     )
 
     # Diagnostics
-    st.markdown("### Diagnostics")
+    st.markdown("### 🔬 Diagnostics")
     disp = result.pearson_chi2 / result.df_resid
     st.metric("Pearson chi2 / df", round(disp, 4),
               help="Value near 1.0 = good fit. >> 1 = overdispersion.")
@@ -552,7 +552,7 @@ def run_glme(df, outcome, fixed_effects, group_col, family_name, plot_template):
             "fix": "Switch to Negative Binomial family for count outcomes.",
         })
 
-    st.markdown("### Diagnostic Summary")
+    st.markdown("### 🩺 Diagnostic Summary")
     _diagnostic_summary(issues)
 
     with st.expander("Full Model Summary"):

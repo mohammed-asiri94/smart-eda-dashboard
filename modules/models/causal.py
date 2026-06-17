@@ -1,9 +1,10 @@
 # ============================================================
 # modules/models/causal.py
-# Causal Inference: Propensity Score Matching + IPW
+# Causal Inference: Multiple Matching Methods + IPW
 # Step 1: Propensity Score (Logistic)
-# Step 2: Matching (Nearest Neighbor + Caliper)
-# Step 3: Outcome Analysis (auto model selection)
+# Step 2: Matching (6 methods) + Common Support Trimming
+# Step 3: Outcome Analysis (auto model selection) + ATE
+# Extras: Rosenbaum Sensitivity, Subgroup Analysis, Placebo Test
 # Full diagnostics + fix suggestions
 # ASCII only - no special characters
 # ============================================================
@@ -23,6 +24,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.neighbors import NearestNeighbors
+from scipy.spatial.distance import mahalanobis
+from scipy.linalg import inv
 
 
 # ============================================================
@@ -31,23 +34,24 @@ from sklearn.neighbors import NearestNeighbors
 
 def _show_issue(level, msg, fix=""):
     if level == "error":
-        st.error("RED: " + msg + ("\n\nFix: " + fix if fix else ""))
+        st.error("🔴 **" + msg + "**" + ("\n\n💡 *Fix:* " + fix if fix else ""))
     elif level == "warning":
-        st.warning("YELLOW: " + msg + ("\n\nFix: " + fix if fix else ""))
+        st.warning("🟡 **" + msg + "**" + ("\n\n💡 *Fix:* " + fix if fix else ""))
     else:
-        st.info("INFO: " + msg)
+        st.info("🔵 " + msg)
 
 
 def _diagnostic_summary(issues):
     if not issues:
-        st.success("All diagnostic checks passed.")
+        st.success("✅ All diagnostic checks passed — no major issues detected.")
     else:
         for i in issues:
             _show_issue(i["level"], i["msg"], i.get("fix", ""))
 
 
 def _quote(col):
-    return 'Q("' + str(col).replace('"', '\\"') + '")'
+    safe = str(col).replace('"', '\\"')
+    return 'Q("' + safe + '")'
 
 
 def _smd(x1, x2):
@@ -58,6 +62,178 @@ def _smd(x1, x2):
     if pooled_sd == 0:
         return 0.0
     return abs(mean1 - mean2) / pooled_sd
+
+
+
+# ============================================================
+# Matching helper functions (6 methods)
+# ============================================================
+
+def _match_psm(ps, treated_idx, control_idx, caliper, n_neighbors, with_replacement):
+    """
+    Nearest Neighbor matching on propensity score.
+    Supports: 1:1, 1:k, with/without replacement.
+    """
+    ps_treated = ps[treated_idx].reshape(-1, 1)
+    ps_control = ps[control_idx].reshape(-1, 1)
+
+    k = max(n_neighbors, 1)
+    search_k = min(len(control_idx), k * 5) if not with_replacement else k
+
+    nn = NearestNeighbors(n_neighbors=search_k, metric="euclidean")
+    nn.fit(ps_control)
+    distances, indices = nn.kneighbors(ps_treated)
+
+    matched_treated = []
+    matched_control = []
+    used_control = set()
+    unmatched = 0
+
+    for i, (dists, idxs) in enumerate(zip(distances, indices)):
+        valid = [(d, idx) for d, idx in zip(dists, idxs) if d <= caliper]
+
+        if not with_replacement:
+            valid = [(d, idx) for d, idx in valid if idx not in used_control]
+
+        if not valid:
+            unmatched += 1
+            continue
+
+        chosen = valid[:k]
+        for d, idx in chosen:
+            matched_treated.append(treated_idx[i])
+            matched_control.append(control_idx[idx])
+            if not with_replacement:
+                used_control.add(idx)
+
+    return matched_treated, matched_control, unmatched
+
+
+def _match_mahalanobis(X_raw, treated_idx, control_idx, caliper_md, with_replacement):
+    """Match on Mahalanobis distance over all covariates."""
+    X = X_raw.values
+    cov = np.cov(X, rowvar=False)
+    try:
+        inv_cov = inv(cov)
+    except Exception:
+        inv_cov = np.linalg.pinv(cov)
+
+    X_treated = X[treated_idx]
+    X_control = X[control_idx]
+
+    matched_treated = []
+    matched_control = []
+    used_control = set()
+    unmatched = 0
+
+    for i, x_t in enumerate(X_treated):
+        dists = []
+        for j, x_c in enumerate(X_control):
+            if not with_replacement and j in used_control:
+                continue
+            try:
+                d = mahalanobis(x_t, x_c, inv_cov)
+            except Exception:
+                d = np.linalg.norm(x_t - x_c)
+            dists.append((d, j))
+
+        if not dists:
+            unmatched += 1
+            continue
+
+        dists.sort(key=lambda x: x[0])
+        best_d, best_j = dists[0]
+
+        if best_d <= caliper_md:
+            matched_treated.append(treated_idx[i])
+            matched_control.append(control_idx[best_j])
+            if not with_replacement:
+                used_control.add(best_j)
+        else:
+            unmatched += 1
+
+    return matched_treated, matched_control, unmatched
+
+
+def _match_exact(data, treatment_col, exact_cols, treated_idx, control_idx):
+    """Exact matching on selected categorical variables."""
+    matched_treated = []
+    matched_control = []
+    unmatched = 0
+
+    keys = data[exact_cols].astype(str).agg("|".join, axis=1)
+
+    control_by_key = {}
+    for idx in control_idx:
+        k = keys.iloc[idx]
+        control_by_key.setdefault(k, []).append(idx)
+
+    used_control = set()
+
+    for idx in treated_idx:
+        k = keys.iloc[idx]
+        candidates = [c for c in control_by_key.get(k, []) if c not in used_control]
+        if candidates:
+            chosen = candidates[0]
+            matched_treated.append(idx)
+            matched_control.append(chosen)
+            used_control.add(chosen)
+        else:
+            unmatched += 1
+
+    return matched_treated, matched_control, unmatched
+
+
+def _match_mixed(data, treatment_col, exact_cols, ps,
+                  treated_idx, control_idx, caliper, with_replacement):
+    """Exact match on exact_cols, then PSM within each stratum."""
+    keys = data[exact_cols].astype(str).agg("|".join, axis=1)
+
+    matched_treated = []
+    matched_control = []
+    unmatched = 0
+
+    treated_set = set(treated_idx)
+    control_set = set(control_idx)
+
+    unique_keys = keys.unique()
+    for k in unique_keys:
+        stratum_idx = np.where(keys.values == k)[0]
+        s_treated = [i for i in stratum_idx if i in treated_set]
+        s_control = [i for i in stratum_idx if i in control_set]
+
+        if not s_treated:
+            continue
+        if not s_control:
+            unmatched += len(s_treated)
+            continue
+
+        s_treated_arr = np.array(s_treated)
+        s_control_arr = np.array(s_control)
+
+        mt, mc, um = _match_psm(
+            ps, s_treated_arr, s_control_arr, caliper,
+            n_neighbors=1, with_replacement=with_replacement,
+        )
+        matched_treated.extend(mt)
+        matched_control.extend(mc)
+        unmatched += um
+
+    return matched_treated, matched_control, unmatched
+
+
+def compute_smart_caliper(ps, multiplier=0.2):
+    """Standard rule: caliper = multiplier * SD(logit(propensity score))."""
+    eps = 1e-6
+    ps_clipped = np.clip(ps, eps, 1 - eps)
+    logit_ps = np.log(ps_clipped / (1 - ps_clipped))
+    sd_logit = np.std(logit_ps)
+    caliper_logit = multiplier * sd_logit
+    median_ps = np.median(ps_clipped)
+    upper = 1 / (1 + np.exp(-(np.log(median_ps / (1 - median_ps)) + caliper_logit)))
+    caliper_ps = abs(upper - median_ps)
+    return round(float(caliper_ps), 4), round(float(sd_logit), 4)
+
 
 
 # ============================================================
@@ -187,23 +363,121 @@ def step1_propensity_score(data, treatment_col, covariate_cols, plot_template):
     st.dataframe(coef_df, use_container_width=True)
 
     # Diagnostic summary
-    st.markdown("### Step 1 Diagnostics")
+    st.markdown("### 🩺 Step 1 Diagnostics")
     _diagnostic_summary(issues)
 
     return ps, X_raw, issues
 
 
+
 # ============================================================
-# Step 2: Matching
+# Common Support Trimming
 # ============================================================
 
-def step2_matching(data, treatment_col, covariate_cols, ps,
-                   X_raw, caliper, n_neighbors, plot_template):
-    st.markdown("## Step 2: Propensity Score Matching")
+def apply_common_support_trimming(data, ps, treatment_col, trim_enabled=True):
+    """
+    Actually trims observations outside the common support region
+    (instead of just warning about them).
+    Returns trimmed data, trimmed ps, and a summary dict.
+    """
+    T = data[treatment_col].astype(int).values
+    ps_treated = ps[T == 1]
+    ps_control = ps[T == 0]
+
+    overlap_min = max(ps_treated.min(), ps_control.min())
+    overlap_max = min(ps_treated.max(), ps_control.max())
+
+    in_support = (ps >= overlap_min) & (ps <= overlap_max)
+    n_before = len(data)
+    n_excluded = int((~in_support).sum())
+
+    summary = {
+        "overlap_min": round(float(overlap_min), 4),
+        "overlap_max": round(float(overlap_max), 4),
+        "n_before": n_before,
+        "n_excluded": n_excluded,
+        "pct_excluded": round(n_excluded / n_before * 100, 2) if n_before > 0 else 0,
+    }
+
+    if not trim_enabled:
+        return data, ps, summary
+
+    data_trimmed = data.iloc[in_support].reset_index(drop=True)
+    ps_trimmed   = ps[in_support]
+
+    return data_trimmed, ps_trimmed, summary
+
+
+def render_common_support_section(data, ps, treatment_col, plot_template, trim_enabled):
+    """Renders the common support plot + trimming summary + returns trimmed data."""
+    st.markdown("### Common Support")
     st.caption(
-        "Each treated unit is matched to the most similar control unit "
-        "based on propensity score distance."
+        "Observations outside the overlapping propensity score region "
+        "cannot be reliably matched and may bias the result if kept."
     )
+
+    data_trimmed, ps_trimmed, summary = apply_common_support_trimming(
+        data, ps, treatment_col, trim_enabled,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Common support range",
+              "[" + str(summary["overlap_min"]) + ", " + str(summary["overlap_max"]) + "]")
+    c2.metric("Observations excluded",
+              str(summary["n_excluded"]) + " (" + str(summary["pct_excluded"]) + "%)")
+    c3.metric("Trimming applied", "Yes" if trim_enabled else "No")
+
+    T = data[treatment_col].astype(int).values
+    ps_df = pd.DataFrame({
+        "Propensity Score": ps,
+        "Group": ["Treated" if t == 1 else "Control" for t in T],
+    })
+    fig = px.histogram(
+        ps_df, x="Propensity Score", color="Group",
+        barmode="overlay", opacity=0.6, nbins=40,
+        color_discrete_map={"Treated": "#2563EB", "Control": "#DC2626"},
+        title="Propensity Score with Common Support Region",
+        template=plot_template,
+    )
+    fig.add_vline(x=summary["overlap_min"], line_dash="dash", line_color="green",
+                 annotation_text="Support min")
+    fig.add_vline(x=summary["overlap_max"], line_dash="dash", line_color="green",
+                 annotation_text="Support max")
+    st.plotly_chart(fig, use_container_width=True)
+
+    if summary["pct_excluded"] > 20:
+        st.warning(
+            "More than 20% of observations fall outside common support. "
+            "Your conclusions will apply only to the overlapping subpopulation, "
+            "not to the full original sample."
+        )
+    elif trim_enabled and summary["n_excluded"] > 0:
+        st.info(
+            str(summary["n_excluded"]) + " observation(s) excluded for being "
+            "outside the common support region."
+        )
+
+    return data_trimmed, ps_trimmed, summary
+
+
+# ============================================================
+# Step 2: Matching (dispatcher for all 6 methods)
+# ============================================================
+
+def step2_matching(data, treatment_col, covariate_cols, ps, X_raw,
+                   matching_method, caliper, n_neighbors,
+                   exact_cols, with_replacement, plot_template):
+    st.markdown("## Step 2: Matching")
+
+    method_descriptions = {
+        "Nearest Neighbor (1:1)": "Each treated unit matched to the single closest control by propensity score.",
+        "Nearest Neighbor (1:k)": "Each treated unit matched to k closest controls by propensity score.",
+        "Nearest Neighbor with Replacement": "Same control unit may be reused across multiple treated units.",
+        "Exact Matching": "Treated and control units must share identical values on the selected categorical variables.",
+        "Exact + Propensity Score (Mixed)": "Exact match on selected categorical variables, then propensity score matching within each stratum.",
+        "Mahalanobis Distance": "Matches on the multivariate distance across all covariates, not just the propensity score.",
+    }
+    st.caption(method_descriptions.get(matching_method, ""))
 
     issues = []
     T = data[treatment_col].astype(int).values
@@ -227,32 +501,60 @@ def step2_matching(data, treatment_col, covariate_cols, ps,
             "fix": "Consider matching with replacement or using IPW instead.",
         })
 
-    # ── Nearest Neighbor Matching ─────────────────────────────
-    ps_treated = ps[treated_idx].reshape(-1, 1)
-    ps_control = ps[control_idx].reshape(-1, 1)
+    # ── Dispatch to the right matching function ───────────────
+    if matching_method == "Nearest Neighbor (1:1)":
+        matched_treated, matched_control, unmatched = _match_psm(
+            ps, treated_idx, control_idx, caliper,
+            n_neighbors=1, with_replacement=False,
+        )
 
-    nn = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean")
-    nn.fit(ps_control)
-    distances, indices = nn.kneighbors(ps_treated)
+    elif matching_method == "Nearest Neighbor (1:k)":
+        matched_treated, matched_control, unmatched = _match_psm(
+            ps, treated_idx, control_idx, caliper,
+            n_neighbors=n_neighbors, with_replacement=False,
+        )
 
-    # Apply caliper
-    matched_treated = []
-    matched_control = []
-    unmatched = 0
+    elif matching_method == "Nearest Neighbor with Replacement":
+        matched_treated, matched_control, unmatched = _match_psm(
+            ps, treated_idx, control_idx, caliper,
+            n_neighbors=1, with_replacement=True,
+        )
 
-    for i, (dists, idxs) in enumerate(zip(distances, indices)):
-        valid = [(d, idx) for d, idx in zip(dists, idxs) if d <= caliper]
-        if valid:
-            best_idx = valid[0][1]
-            matched_treated.append(treated_idx[i])
-            matched_control.append(control_idx[best_idx])
-        else:
-            unmatched += 1
+    elif matching_method == "Exact Matching":
+        if not exact_cols:
+            st.error("Select at least one variable for Exact Matching.")
+            return None, None
+        matched_treated, matched_control, unmatched = _match_exact(
+            data, treatment_col, exact_cols, treated_idx, control_idx,
+        )
+
+    elif matching_method == "Exact + Propensity Score (Mixed)":
+        if not exact_cols:
+            st.error("Select at least one variable for the Exact step of Mixed Matching.")
+            return None, None
+        matched_treated, matched_control, unmatched = _match_mixed(
+            data, treatment_col, exact_cols, ps,
+            treated_idx, control_idx, caliper, with_replacement,
+        )
+
+    elif matching_method == "Mahalanobis Distance":
+        # caliper here is interpreted on Mahalanobis scale; use a generous default if too small
+        md_caliper = max(caliper * 10, 1.0)
+        matched_treated, matched_control, unmatched = _match_mahalanobis(
+            X_raw, treated_idx, control_idx, md_caliper, with_replacement,
+        )
+
+    else:
+        matched_treated, matched_control, unmatched = _match_psm(
+            ps, treated_idx, control_idx, caliper,
+            n_neighbors=1, with_replacement=False,
+        )
 
     if not matched_treated:
         st.error(
-            "No matches found within caliper = " + str(caliper) + ". "
-            "Try increasing the caliper."
+            "No matches found with the current settings. "
+            "Try increasing the caliper, choosing fewer exact-match variables, "
+            "or switching matching method."
         )
         return None, None
 
@@ -267,13 +569,13 @@ def step2_matching(data, treatment_col, covariate_cols, ps,
     m1.metric("Matched pairs",     n_matched)
     m2.metric("Unmatched treated", unmatched)
     m3.metric("Match rate",        str(match_rate) + "%")
-    m4.metric("Caliper used",      caliper)
+    m4.metric("Method",            matching_method.split(" (")[0])
 
     if match_rate < 70:
         issues.append({
             "level": "warning",
             "msg": "Match rate is " + str(match_rate) + "% - many treated units unmatched.",
-            "fix": "Increase caliper size or use IPW which uses all observations.",
+            "fix": "Increase caliper size, allow replacement, or use IPW which uses all observations.",
         })
 
     # ── Matched PS distribution ───────────────────────────────
@@ -306,12 +608,10 @@ def step2_matching(data, treatment_col, covariate_cols, ps,
         if col not in data.columns:
             continue
 
-        # Before matching
         before_t = data.loc[data[treatment_col] == 1, col].dropna()
         before_c = data.loc[data[treatment_col] == 0, col].dropna()
         smd_before = round(_smd(before_t.values, before_c.values), 4)
 
-        # After matching
         after_t = matched_data.loc[matched_data[treatment_col] == 1, col].dropna()
         after_c = matched_data.loc[matched_data[treatment_col] == 0, col].dropna()
         smd_after = round(_smd(after_t.values, after_c.values), 4)
@@ -329,7 +629,6 @@ def step2_matching(data, treatment_col, covariate_cols, ps,
     if not balance_df.empty:
         st.dataframe(balance_df, use_container_width=True)
 
-        # Love plot
         st.markdown("### Love Plot")
         st.caption("Good matching moves SMD values closer to 0.")
 
@@ -349,7 +648,6 @@ def step2_matching(data, treatment_col, covariate_cols, ps,
             name="After Matching",
         ))
 
-        # Lines connecting before/after
         for _, row in balance_df.iterrows():
             fig_love.add_shape(
                 type="line",
@@ -369,7 +667,6 @@ def step2_matching(data, treatment_col, covariate_cols, ps,
         )
         st.plotly_chart(fig_love, use_container_width=True)
 
-        # Balance summary
         n_balanced = (balance_df["SMD After"] < 0.10).sum()
         n_total_cov = len(balance_df)
         st.metric(
@@ -390,7 +687,7 @@ def step2_matching(data, treatment_col, covariate_cols, ps,
         else:
             st.success("Good covariate balance achieved after matching.")
 
-    st.markdown("### Step 2 Diagnostics")
+    st.markdown("### 🩺 Step 2 Diagnostics")
     _diagnostic_summary(issues)
 
     return matched_data, balance_df
@@ -560,7 +857,7 @@ def step3_outcome(matched_data, treatment_col, outcome_col,
     st.dataframe(coef_tbl, use_container_width=True)
 
     st.download_button(
-        "Download outcome model results (CSV)",
+        "📥 Download outcome model results (CSV)",
         data=coef_tbl.to_csv(index=False).encode(),
         file_name="causal_outcome_model.csv",
         mime="text/csv",
@@ -619,15 +916,405 @@ def step3_outcome(matched_data, treatment_col, outcome_col,
                 "fix": "Switch outcome type to 'Count (overdispersed)' to use Negative Binomial.",
             })
 
-    st.markdown("### Step 3 Diagnostics")
+    st.markdown("### 🩺 Step 3 Diagnostics")
     _diagnostic_summary(issues)
 
     with st.expander("Full Model Summary"):
         st.text(result.summary().as_text())
 
+    return {
+        "att_value": float(treat_param),
+        "att_pval": float(treat_pval),
+        "att_ci_lo": treat_ci_lo,
+        "att_ci_hi": treat_ci_hi,
+        "model_name": model_name,
+    }
+
+
 
 # ============================================================
-# IPW — Inverse Probability Weighting
+# ATE estimation + ATT vs ATE comparison
+# ============================================================
+
+def estimate_ate(data_full, ps, treatment_col, outcome_col, outcome_type):
+    """
+    Estimate ATE using IPW on the full (unmatched) sample.
+    ATE weight: treated = 1/ps, control = 1/(1-ps)
+    """
+    T = data_full[treatment_col].astype(int).values
+    eps = 1e-6
+    ps_clipped = np.clip(ps, eps, 1 - eps)
+
+    weights_ate = np.where(T == 1, 1.0 / ps_clipped, 1.0 / (1 - ps_clipped))
+    w_cap = np.percentile(weights_ate, 99)
+    weights_ate_trimmed = np.clip(weights_ate, 0, w_cap)
+
+    data = data_full.copy()
+
+    try:
+        if outcome_type == "Continuous":
+            result = sm.WLS(
+                data[outcome_col], sm.add_constant(data[treatment_col]),
+                weights=weights_ate_trimmed,
+            ).fit()
+        else:
+            result = sm.WLS(
+                data[outcome_col].astype(float),
+                sm.add_constant(data[treatment_col].astype(float)),
+                weights=weights_ate_trimmed,
+            ).fit()
+
+        ate = float(result.params.iloc[1])
+        ate_pval = float(result.pvalues.iloc[1])
+        ate_ci = result.conf_int().iloc[1]
+        ate_ci_lo, ate_ci_hi = float(ate_ci[0]), float(ate_ci[1])
+
+        return {
+            "ATE": round(ate, 4),
+            "p-value": round(ate_pval, 5),
+            "CI Lower": round(ate_ci_lo, 4),
+            "CI Upper": round(ate_ci_hi, 4),
+        }
+    except Exception as e:
+        return None
+
+
+def render_att_vs_ate(att_value, att_pval, att_ci_lo, att_ci_hi,
+                       data_full, ps, treatment_col, outcome_col, outcome_type):
+    st.markdown("### ATT vs ATE")
+    st.caption(
+        "ATT = effect on those who actually received treatment. "
+        "ATE = expected effect if treatment were applied to the entire population."
+    )
+
+    ate_result = estimate_ate(data_full, ps, treatment_col, outcome_col, outcome_type)
+
+    if ate_result is None:
+        st.info("ATE could not be estimated for this outcome type.")
+        return
+
+    compare_df = pd.DataFrame({
+        "Estimand": ["ATT (matched sample)", "ATE (full sample, IPW)"],
+        "Estimate": [round(att_value, 4), ate_result["ATE"]],
+        "p-value":  [round(att_pval, 5), ate_result["p-value"]],
+        "CI Lower": [round(att_ci_lo, 4), ate_result["CI Lower"]],
+        "CI Upper": [round(att_ci_hi, 4), ate_result["CI Upper"]],
+    })
+    st.dataframe(compare_df, use_container_width=True)
+
+    if abs(att_value - ate_result["ATE"]) > 0.2 * max(abs(att_value), 1e-6):
+        direction = "larger" if abs(att_value) > abs(ate_result["ATE"]) else "smaller"
+        st.info(
+            "ATT is notably " + direction + " than ATE. "
+            "This suggests treatment effects differ between those who self-selected "
+            "into treatment and the broader population."
+        )
+    else:
+        st.success("ATT and ATE are similar, suggesting a fairly consistent treatment effect across the population.")
+
+
+# ============================================================
+# Subgroup / Heterogeneous Treatment Effects
+# ============================================================
+
+def render_subgroup_analysis(matched_data, treatment_col, outcome_col,
+                              outcome_type, all_cols, plot_template):
+    st.markdown("### Subgroup Analysis — Heterogeneous Treatment Effects")
+    st.caption(
+        "Checks whether the treatment effect differs across subgroups "
+        "(e.g., age groups, gender, severity level)."
+    )
+
+    candidate_cols = [
+        c for c in all_cols
+        if c in matched_data.columns
+        and c not in (treatment_col, outcome_col)
+        and matched_data[c].nunique() <= 10
+    ]
+
+    if not candidate_cols:
+        st.info("No suitable categorical/low-cardinality variable found for subgroup analysis.")
+        return
+
+    subgroup_col = st.selectbox(
+        "Subgroup variable",
+        candidate_cols,
+        key="ci_subgroup_col",
+    )
+
+    results = []
+    for grp in sorted(matched_data[subgroup_col].dropna().unique()):
+        sub = matched_data[matched_data[subgroup_col] == grp]
+        n_t = (sub[treatment_col] == 1).sum()
+        n_c = (sub[treatment_col] == 0).sum()
+
+        if n_t < 3 or n_c < 3:
+            results.append({
+                "Subgroup": str(grp), "ATT": None, "p-value": None,
+                "N": len(sub), "Note": "Too few observations",
+            })
+            continue
+
+        try:
+            if outcome_type == "Continuous":
+                m = sm.OLS(
+                    sub[outcome_col],
+                    sm.add_constant(sub[treatment_col]),
+                ).fit()
+            else:
+                m = sm.OLS(
+                    sub[outcome_col].astype(float),
+                    sm.add_constant(sub[treatment_col].astype(float)),
+                ).fit()
+            att = float(m.params.iloc[1])
+            pval = float(m.pvalues.iloc[1])
+            results.append({
+                "Subgroup": str(grp), "ATT": round(att, 4),
+                "p-value": round(pval, 5), "N": len(sub), "Note": "",
+            })
+        except Exception:
+            results.append({
+                "Subgroup": str(grp), "ATT": None, "p-value": None,
+                "N": len(sub), "Note": "Model failed",
+            })
+
+    results_df = pd.DataFrame(results)
+    st.dataframe(results_df, use_container_width=True)
+
+    valid_results = results_df.dropna(subset=["ATT"])
+    if not valid_results.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=valid_results["ATT"], y=valid_results["Subgroup"],
+            mode="markers",
+            marker=dict(
+                size=12,
+                color=["#16A34A" if p < 0.05 else "#94A3B8" for p in valid_results["p-value"]],
+            ),
+            name="ATT by subgroup",
+        ))
+        fig.add_vline(x=0, line_dash="dash", line_color="red")
+        fig.update_layout(
+            title="Treatment Effect by Subgroup (" + subgroup_col + ")",
+            xaxis_title="ATT",
+            template=plot_template,
+            height=max(300, len(valid_results) * 50 + 100),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Green = statistically significant (p<0.05). Grey = not significant.")
+
+
+# ============================================================
+# Placebo Test
+# ============================================================
+
+def render_placebo_test(matched_data, treatment_col, all_cols,
+                        outcome_col, plot_template):
+    st.markdown("### Placebo Test")
+    st.caption(
+        "Runs the same analysis on an outcome that should NOT be affected by treatment "
+        "(e.g., a pre-treatment measurement). A significant effect here would suggest "
+        "hidden bias in the matching method."
+    )
+
+    candidate_outcomes = [
+        c for c in all_cols
+        if c in matched_data.columns
+        and c not in (treatment_col, outcome_col)
+        and pd.api.types.is_numeric_dtype(matched_data[c])
+    ]
+
+    if not candidate_outcomes:
+        st.info("No suitable numeric variable available to use as a placebo outcome.")
+        return
+
+    placebo_col = st.selectbox(
+        "Placebo outcome (should be unaffected by treatment)",
+        candidate_outcomes,
+        key="ci_placebo_col",
+    )
+
+    if st.button("Run Placebo Test", key="ci_placebo_run"):
+        try:
+            m = sm.OLS(
+                matched_data[placebo_col].astype(float),
+                sm.add_constant(matched_data[treatment_col].astype(float)),
+            ).fit()
+            att = float(m.params.iloc[1])
+            pval = float(m.pvalues.iloc[1])
+
+            c1, c2 = st.columns(2)
+            c1.metric("Placebo effect estimate", round(att, 4))
+            c2.metric("p-value", round(pval, 5))
+
+            if pval >= 0.05:
+                st.success(
+                    "No significant effect on the placebo outcome (p=" + str(round(pval,4)) +
+                    "). This supports the validity of the matching approach."
+                )
+            else:
+                st.error(
+                    "Significant effect detected on a variable that should be unaffected "
+                    "(p=" + str(round(pval,4)) + "). This is a warning sign of hidden bias "
+                    "in the matching — interpret the main result with caution."
+                )
+        except Exception as e:
+            st.warning("Placebo test could not be run: " + str(e))
+
+
+# ============================================================
+# Rosenbaum Bounds Sensitivity Analysis
+# ============================================================
+
+def rosenbaum_bounds(matched_data, treatment_col, outcome_col, outcome_type,
+                     gammas=None):
+    """
+    Rosenbaum sensitivity analysis for matched-pairs data.
+    Approximation using Wilcoxon signed-rank style bounds for continuous outcomes,
+    and McNemar-style bounds for binary outcomes on matched pairs.
+
+    This requires the matched data to be organized in pairs (1 treated : 1 control).
+    If matching produced 1:k or many-to-one matches, we use the first control
+    per treated unit to form pairs for this analysis (clearly noted to the user).
+    """
+    if gammas is None:
+        gammas = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+
+    data = matched_data.copy()
+    treated = data[data[treatment_col] == 1].reset_index(drop=True)
+    control = data[data[treatment_col] == 0].reset_index(drop=True)
+
+    n_pairs = min(len(treated), len(control))
+    if n_pairs < 5:
+        return None, "Not enough matched pairs (need at least 5) for sensitivity analysis."
+
+    treated = treated.iloc[:n_pairs]
+    control = control.iloc[:n_pairs]
+
+    if outcome_type == "Continuous":
+        diffs = treated[outcome_col].values - control[outcome_col].values
+        # Wilcoxon signed-rank based bounds (approximate, large-sample normal approx)
+        nonzero_diffs = diffs[diffs != 0]
+        if len(nonzero_diffs) < 5:
+            return None, "Not enough non-zero differences for sensitivity analysis."
+
+        ranks = stats.rankdata(np.abs(nonzero_diffs))
+        signs = np.sign(nonzero_diffs)
+        W = np.sum(ranks[signs > 0])
+        n = len(nonzero_diffs)
+
+        results = []
+        for gamma in gammas:
+            p_plus = gamma / (1 + gamma)
+            p_minus = 1 / (1 + gamma)
+
+            mean_W_plus = p_plus * np.sum(ranks)
+            var_W = p_plus * p_minus * np.sum(ranks ** 2)
+
+            z_upper = (W - mean_W_plus) / np.sqrt(var_W) if var_W > 0 else 0
+            p_upper = 1 - stats.norm.cdf(z_upper)
+
+            mean_W_minus = p_minus * np.sum(ranks)
+            z_lower = (W - mean_W_minus) / np.sqrt(var_W) if var_W > 0 else 0
+            p_lower = 1 - stats.norm.cdf(z_lower)
+
+            results.append({
+                "Gamma": gamma,
+                "p-value (Lower bound)": round(float(min(p_lower, p_upper)), 5),
+                "p-value (Upper bound)": round(float(max(p_lower, p_upper)), 5),
+            })
+
+    else:
+        # Binary outcome: McNemar-style sign test bounds
+        diffs = treated[outcome_col].values.astype(float) - control[outcome_col].values.astype(float)
+        n_plus = int((diffs > 0).sum())   # treated better
+        n_minus = int((diffs < 0).sum())  # control better
+        n_disc = n_plus + n_minus
+
+        if n_disc < 5:
+            return None, "Not enough discordant pairs for sensitivity analysis."
+
+        results = []
+        for gamma in gammas:
+            p_plus = gamma / (1 + gamma)
+            p_minus = 1 / (1 + gamma)
+
+            p_upper = 1 - stats.binom.cdf(n_plus - 1, n_disc, p_plus)
+            p_lower = 1 - stats.binom.cdf(n_plus - 1, n_disc, p_minus)
+
+            results.append({
+                "Gamma": gamma,
+                "p-value (Lower bound)": round(float(min(p_lower, p_upper)), 5),
+                "p-value (Upper bound)": round(float(max(p_lower, p_upper)), 5),
+            })
+
+    return pd.DataFrame(results), None
+
+
+def render_rosenbaum_section(matched_data, treatment_col, outcome_col,
+                             outcome_type, plot_template):
+    st.markdown("### Sensitivity Analysis — Rosenbaum Bounds")
+    st.caption(
+        "Tests how robust the result is to a hidden (unmeasured) confounder. "
+        "Gamma = the strength of hidden bias needed to overturn the conclusion. "
+        "Higher Gamma at which p stays below 0.05 means a more robust result."
+    )
+
+    bounds_df, error_msg = rosenbaum_bounds(
+        matched_data, treatment_col, outcome_col, outcome_type,
+    )
+
+    if error_msg:
+        st.info(error_msg)
+        return
+
+    st.dataframe(bounds_df, use_container_width=True)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=bounds_df["Gamma"], y=bounds_df["p-value (Upper bound)"],
+        mode="lines+markers", name="Upper bound p-value",
+        line=dict(color="#DC2626", width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=bounds_df["Gamma"], y=bounds_df["p-value (Lower bound)"],
+        mode="lines+markers", name="Lower bound p-value",
+        line=dict(color="#2563EB", width=2),
+    ))
+    fig.add_hline(y=0.05, line_dash="dash", line_color="orange",
+                 annotation_text="p = 0.05")
+    fig.update_layout(
+        title="Rosenbaum Sensitivity Bounds",
+        xaxis_title="Gamma (hidden bias strength)",
+        yaxis_title="p-value",
+        template=plot_template,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Find the critical gamma where upper bound crosses 0.05
+    crit_rows = bounds_df[bounds_df["p-value (Upper bound)"] >= 0.05]
+    if not crit_rows.empty:
+        crit_gamma = crit_rows["Gamma"].iloc[0]
+        st.warning(
+            "Result becomes non-significant at Gamma = " + str(crit_gamma) + ". "
+            "A hidden confounder with this strength (or stronger) could explain away the effect."
+        )
+    else:
+        max_gamma = bounds_df["Gamma"].max()
+        st.success(
+            "Result remains significant up to Gamma = " + str(max_gamma) +
+            " (the highest tested value). This suggests a robust finding, "
+            "though stronger hidden bias was not tested."
+        )
+
+    st.caption(
+        "Note: this analysis approximates matched pairs from the first control "
+        "matched to each treated unit when matching was 1:k."
+    )
+
+
+# ============================================================
+# IPW - Inverse Probability Weighting
 # ============================================================
 
 def run_ipw(data, treatment_col, outcome_col,
@@ -738,8 +1425,121 @@ def run_ipw(data, treatment_col, outcome_col,
     except Exception as e:
         st.warning("IPW outcome model could not be fitted: " + str(e))
 
-    st.markdown("### IPW Diagnostics")
+    st.markdown("### 🩺 IPW Diagnostics")
     _diagnostic_summary(issues)
+
+
+
+# ============================================================
+# HTML Report Generation
+# ============================================================
+
+def generate_causal_html_report(
+    treatment_col, outcome_col, outcome_type, matching_method,
+    n_treated_orig, n_control_orig,
+    auc, overlap_pct,
+    n_matched, match_rate, balance_df,
+    att_value, att_pval, att_ci_lo, att_ci_hi,
+    ate_result,
+    rosenbaum_df,
+):
+    balance_html = (
+        balance_df.to_html(index=False)
+        if balance_df is not None and not balance_df.empty
+        else "<p>No balance table available.</p>"
+    )
+    rosenbaum_html = (
+        rosenbaum_df.to_html(index=False)
+        if rosenbaum_df is not None and not rosenbaum_df.empty
+        else "<p>Sensitivity analysis not available (insufficient matched pairs).</p>"
+    )
+    ate_html = (
+        "<p>ATE: " + str(ate_result["ATE"]) + " (95% CI: " +
+        str(ate_result["CI Lower"]) + " to " + str(ate_result["CI Upper"]) +
+        ", p=" + str(ate_result["p-value"]) + ")</p>"
+        if ate_result else "<p>ATE not available.</p>"
+    )
+
+    significance = "statistically significant" if att_pval < 0.05 else "not statistically significant"
+
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Causal Inference Report</title>
+<style>
+  body {{ font-family: Arial, sans-serif; margin: 40px; background: #F8FAFC; color: #0F172A; }}
+  .header {{ background: linear-gradient(135deg, #1E3A8A, #2563EB); color: white;
+             padding: 30px; border-radius: 16px; margin-bottom: 30px; }}
+  .header h1 {{ margin: 0; }}
+  .card {{ background: white; padding: 20px; border-radius: 14px; margin-bottom: 25px;
+           border: 1px solid #E2E8F0; }}
+  h2 {{ color: #1E3A8A; border-bottom: 2px solid #E2E8F0; padding-bottom: 8px; }}
+  table {{ border-collapse: collapse; width: 100%; margin-top: 15px; font-size: 14px; }}
+  th, td {{ border: 1px solid #CBD5E1; padding: 8px; text-align: left; }}
+  th {{ background: #E0F2FE; }}
+  .metric {{ display: inline-block; background: #F1F5F9; border-radius: 10px;
+             padding: 12px 18px; margin: 6px; min-width: 140px; text-align: center; }}
+  .metric-value {{ font-size: 22px; font-weight: bold; color: #2563EB; }}
+  .metric-label {{ font-size: 12px; color: #64748B; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Causal Inference Report</h1>
+  <p>Treatment: {treatment_col} &mdash; Outcome: {outcome_col} ({outcome_type})</p>
+</div>
+
+<div class="card">
+  <h2>1. Executive Summary</h2>
+  <p>The estimated Average Treatment Effect on the Treated (ATT) is
+  <strong>{att_value}</strong> (95% CI: {att_ci_lo} to {att_ci_hi}, p={att_pval}).
+  This result is <strong>{significance}</strong>.</p>
+</div>
+
+<div class="card">
+  <h2>2. Method</h2>
+  <p>Propensity scores were estimated using logistic regression. Matching method:
+  <strong>{matching_method}</strong>.</p>
+  <div class="metric"><div class="metric-value">{n_treated_orig}</div><div class="metric-label">Original Treated</div></div>
+  <div class="metric"><div class="metric-value">{n_control_orig}</div><div class="metric-label">Original Control</div></div>
+  <div class="metric"><div class="metric-value">{auc}</div><div class="metric-label">PS Model AUC</div></div>
+  <div class="metric"><div class="metric-value">{overlap_pct}%</div><div class="metric-label">Common Support</div></div>
+</div>
+
+<div class="card">
+  <h2>3. Matching Quality</h2>
+  <div class="metric"><div class="metric-value">{n_matched}</div><div class="metric-label">Matched Pairs</div></div>
+  <div class="metric"><div class="metric-value">{match_rate}%</div><div class="metric-label">Match Rate</div></div>
+  {balance_html}
+</div>
+
+<div class="card">
+  <h2>4. Treatment Effect</h2>
+  <div class="metric"><div class="metric-value">{att_value}</div><div class="metric-label">ATT</div></div>
+  <div class="metric"><div class="metric-value">{att_pval}</div><div class="metric-label">p-value</div></div>
+  <p>95% Confidence Interval: [{att_ci_lo}, {att_ci_hi}]</p>
+  {ate_html}
+</div>
+
+<div class="card">
+  <h2>5. Sensitivity Analysis (Rosenbaum Bounds)</h2>
+  <p>Tests robustness of the result to unmeasured confounding.</p>
+  {rosenbaum_html}
+</div>
+
+<div class="card">
+  <h2>6. Conclusion</h2>
+  <p>Based on the matched-sample analysis, the treatment effect is {significance}.
+  Users should review the covariate balance table and sensitivity analysis above
+  before drawing causal conclusions, and confirm that the ignorability and
+  positivity assumptions are plausible for this dataset.</p>
+</div>
+
+</body>
+</html>
+"""
 
 
 # ============================================================
@@ -749,12 +1549,10 @@ def run_ipw(data, treatment_col, outcome_col,
 def render_causal_tab(df, df_cleaned, plot_template):
     st.markdown("# Causal Inference")
     st.info(
-        "Estimates the **causal effect** of a treatment or intervention "
-        "by balancing observed confounders between treated and control groups. "
-        "Uses Propensity Score Matching (PSM) and/or Inverse Probability Weighting (IPW)."
+        "Estimates the causal effect of a treatment or intervention "
+        "by balancing observed confounders between treated and control groups."
     )
 
-    # Dataset
     dataset_choice = st.radio(
         "Dataset to use",
         ["Original data", "Cleaned data (from Data Cleaning tab)"],
@@ -765,6 +1563,7 @@ def render_causal_tab(df, df_cleaned, plot_template):
 
     all_cols     = mdf.columns.tolist()
     numeric_cols = mdf.select_dtypes(include=np.number).columns.tolist()
+    cat_cols_all = mdf.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
 
     if len(all_cols) < 3:
         st.warning("Need at least 3 columns: treatment + outcome + covariates.")
@@ -794,6 +1593,48 @@ def render_causal_tab(df, df_cleaned, plot_template):
             key="ci_outcome_type",
         )
 
+    # ── Immediate readiness checks ─────────────────────────────
+    readiness_issues = []
+
+    unique_treat_vals = mdf[treatment_col].dropna().unique()
+    if len(unique_treat_vals) != 2:
+        readiness_issues.append(
+            "Treatment column '" + treatment_col + "' has " +
+            str(len(unique_treat_vals)) + " unique values, but must have exactly 2."
+        )
+
+    if pd.api.types.is_numeric_dtype(mdf[outcome_col]):
+        unique_outcome_vals = mdf[outcome_col].dropna().unique()
+        if outcome_type == "Binary" and len(unique_outcome_vals) > 2:
+            readiness_issues.append(
+                "Outcome type is set to 'Binary' but '" + outcome_col +
+                "' has " + str(len(unique_outcome_vals)) + " unique values."
+            )
+        if outcome_type in ("Count", "Count (overdispersed)"):
+            if (mdf[outcome_col].dropna() < 0).any():
+                readiness_issues.append(
+                    "Outcome type is set to '" + outcome_type +
+                    "' but '" + outcome_col + "' contains negative values."
+                )
+    else:
+        if outcome_type != "Binary":
+            readiness_issues.append(
+                "'" + outcome_col + "' contains text/categories. "
+                "Set Outcome type to 'Binary' or choose a numeric outcome column."
+            )
+
+    n_treated_check = int((mdf[treatment_col] == unique_treat_vals[0]).sum()) if len(unique_treat_vals) > 0 else 0
+    if len(mdf) < 20:
+        readiness_issues.append(
+            "Dataset has only " + str(len(mdf)) + " rows. Causal analysis needs at least 20."
+        )
+
+    if readiness_issues:
+        for issue in readiness_issues:
+            st.warning(issue)
+    else:
+        st.success("Column setup looks valid. Configure covariates and matching below.")
+
     available_covs = [c for c in all_cols if c not in (treatment_col, outcome_col)]
     covariate_cols = st.multiselect(
         "Confounders / covariates for propensity score",
@@ -803,54 +1644,120 @@ def render_causal_tab(df, df_cleaned, plot_template):
         help="Variables that affect both treatment assignment and outcome.",
     )
 
-    # ── Matching settings ─────────────────────────────────────
-    st.markdown("### Matching Settings")
-    ms1, ms2, ms3 = st.columns(3)
-    with ms1:
-        caliper = st.number_input(
-            "Caliper (max PS distance)",
-            min_value=0.001, max_value=0.5,
-            value=0.2, step=0.01,
-            key="ci_caliper",
-            help="Maximum allowed propensity score distance for a valid match. "
-                 "Smaller = stricter matching. Typical: 0.1-0.25.",
+    # ── Matching method selection ─────────────────────────────
+    st.markdown("### Matching Method")
+
+    MATCHING_METHODS = [
+        "Nearest Neighbor (1:1)",
+        "Nearest Neighbor (1:k)",
+        "Nearest Neighbor with Replacement",
+        "Exact Matching",
+        "Exact + Propensity Score (Mixed)",
+        "Mahalanobis Distance",
+    ]
+    matching_method = st.selectbox(
+        "Choose matching method",
+        MATCHING_METHODS,
+        key="ci_matching_method",
+    )
+
+    # ── Method-specific settings ──────────────────────────────
+    exact_cols = []
+    n_neighbors = 1
+    with_replacement = False
+
+    if matching_method == "Nearest Neighbor (1:k)":
+        n_neighbors = st.slider(
+            "k (number of control matches per treated unit)",
+            2, 5, 2, key="ci_k_neighbors",
         )
-    with ms2:
-        n_neighbors = st.number_input(
-            "Neighbors to consider",
-            min_value=1, max_value=10,
-            value=1, step=1,
-            key="ci_neighbors",
+
+    if matching_method == "Nearest Neighbor with Replacement":
+        with_replacement = True
+
+    if matching_method in ("Exact Matching", "Exact + Propensity Score (Mixed)"):
+        exact_candidates = [
+            c for c in covariate_cols
+            if mdf[c].nunique() <= 15
+        ]
+        if not exact_candidates:
+            st.warning(
+                "No low-cardinality categorical covariates available for exact matching. "
+                "Add categorical variables with few unique values to the covariate list."
+            )
+        exact_cols = st.multiselect(
+            "Variables to match exactly",
+            exact_candidates,
+            default=exact_candidates[:min(2, len(exact_candidates))],
+            key="ci_exact_cols",
         )
-    with ms3:
-        run_ipw_also = st.checkbox(
-            "Also run IPW",
-            value=True,
-            key="ci_ipw",
-            help="Run IPW in addition to matching for comparison.",
+        if matching_method == "Exact + Propensity Score (Mixed)":
+            with_replacement = st.checkbox(
+                "Allow replacement within strata", value=False, key="ci_mixed_replacement",
+            )
+
+    # ── Caliper settings ───────────────────────────────────────
+    st.markdown("### Caliper Settings")
+    cal1, cal2 = st.columns(2)
+    with cal1:
+        caliper_mode = st.radio(
+            "Caliper mode",
+            ["Auto (0.2 x SD of logit(PS))", "Manual"],
+            key="ci_caliper_mode",
         )
+    with cal2:
+        if caliper_mode == "Manual":
+            caliper_manual = st.number_input(
+                "Caliper (max PS distance)",
+                min_value=0.001, max_value=0.5,
+                value=0.2, step=0.01,
+                key="ci_caliper_manual",
+            )
+        else:
+            caliper_manual = None
+            st.caption("Caliper will be computed automatically after propensity scores are estimated.")
+
+    # ── Common support trimming ───────────────────────────────
+    trim_support = st.checkbox(
+        "Trim observations outside common support before matching",
+        value=True, key="ci_trim_support",
+        help="Recommended. Removes units with no realistic comparison in the other group.",
+    )
+
+    # ── IPW + extras ───────────────────────────────────────────
+    st.markdown("### Additional Analyses")
+    ax1, ax2, ax3 = st.columns(3)
+    with ax1:
+        run_ipw_also = st.checkbox("Run IPW (alongside matching)", value=True, key="ci_ipw")
+    with ax2:
+        run_sensitivity = st.checkbox("Run sensitivity analysis (Rosenbaum Bounds)", value=True, key="ci_sens")
+    with ax3:
+        run_ate = st.checkbox("Estimate ATE (in addition to ATT)", value=True, key="ci_ate")
+
+    ax4, ax5 = st.columns(2)
+    with ax4:
+        run_subgroup = st.checkbox("Run subgroup analysis", value=False, key="ci_subgroup")
+    with ax5:
+        run_placebo = st.checkbox("Run placebo test", value=False, key="ci_placebo")
 
     # ── Guidance ──────────────────────────────────────────────
     with st.expander("How causal inference works here"):
         st.markdown("""
-**Step 1 - Propensity Score:**
-- Logistic regression: P(Treatment=1 | covariates)
-- Check: AUC between 0.6-0.9, good overlap between groups
+**Step 1 - Propensity Score:** Logistic regression estimates P(Treatment=1 | covariates).
 
-**Step 2 - Matching:**
-- Each treated unit matched to nearest control by PS distance
-- Caliper prevents bad matches
-- Check: SMD < 0.1 for all covariates after matching (Love Plot)
+**Step 2 - Matching:** Choose from 6 methods:
+- Nearest Neighbor (1:1, 1:k, with replacement) - matches on propensity score
+- Exact Matching - matches identically on selected categorical variables
+- Exact + PSM (Mixed) - exact match on categories, then PSM within each group
+- Mahalanobis Distance - matches on the full covariate vector, not just PS
 
-**Step 3 - Outcome Analysis:**
-- Regression on matched sample
-- Treatment coefficient = ATT (Average Treatment Effect on the Treated)
-- Model type chosen based on outcome type
+**Step 3 - Outcome Analysis:** Regression on the matched sample gives the ATT.
 
-**Key assumptions:**
-- Ignorability: no unmeasured confounders
-- Positivity: all units have PS between 0 and 1
-- SUTVA: one unit's treatment does not affect another's outcome
+**Additional analyses:**
+- ATE: effect if treatment were applied to everyone (via IPW on full sample)
+- Sensitivity (Rosenbaum Bounds): how robust the result is to hidden confounders
+- Subgroup analysis: does the effect vary across population segments
+- Placebo test: sanity check using an outcome that should show no effect
         """)
 
     # ── Run ───────────────────────────────────────────────────
@@ -859,7 +1766,10 @@ def render_causal_tab(df, df_cleaned, plot_template):
             st.error("Select at least one covariate for the propensity score model.")
             return
 
-        # Validate treatment
+        if matching_method in ("Exact Matching", "Exact + Propensity Score (Mixed)") and not exact_cols:
+            st.error("Select at least one variable for exact matching.")
+            return
+
         unique_t = mdf[treatment_col].dropna().unique()
         if len(unique_t) != 2:
             st.error(
@@ -875,53 +1785,173 @@ def render_causal_tab(df, df_cleaned, plot_template):
             )
             st.info("Treatment encoded: " + str(sorted_t[0]) + "->0, " + str(sorted_t[1]) + "->1")
 
-        # Drop rows with missing in key columns
-        key_cols = [treatment_col, outcome_col] + covariate_cols
-        data_clean = mdf[key_cols].dropna().copy()
+        key_cols = list(set([treatment_col, outcome_col] + covariate_cols))
+        data_clean = mdf[key_cols].dropna().copy().reset_index(drop=True)
 
         if len(data_clean) < 20:
             st.error("Too few complete observations (" + str(len(data_clean)) + "). Need at least 20.")
             return
 
-        n_treated = (data_clean[treatment_col] == 1).sum()
-        n_control = (data_clean[treatment_col] == 0).sum()
+        n_treated_orig = int((data_clean[treatment_col] == 1).sum())
+        n_control_orig = int((data_clean[treatment_col] == 0).sum())
         st.markdown(
             "Complete observations: **" + str(len(data_clean)) + "** | "
-            "Treated: **" + str(n_treated) + "** | "
-            "Control: **" + str(n_control) + "**"
+            "Treated: **" + str(n_treated_orig) + "** | "
+            "Control: **" + str(n_control_orig) + "**"
         )
 
         try:
-            # Step 1
+            ci_progress = st.progress(0, text="Step 1/5: Estimating propensity scores...")
+
+            # ── Step 1 ──────────────────────────────────────────
             st.markdown("---")
             ps, X_raw, ps_issues = step1_propensity_score(
                 data_clean, treatment_col, covariate_cols, plot_template
             )
 
-            # Step 2
+            auc_value = float(roc_auc_score(
+                data_clean[treatment_col].astype(int), ps
+            ))
+
+            ci_progress.progress(20, text="Step 2/5: Checking common support...")
+
+            # ── Common support trimming ─────────────────────────
             st.markdown("---")
+            data_for_matching, ps_for_matching, support_summary = render_common_support_section(
+                data_clean, ps, treatment_col, plot_template, trim_support,
+            )
+
+            if len(data_for_matching) < 20:
+                ci_progress.empty()
+                st.error("Too few observations remain after common support trimming.")
+                return
+
+            # ── Smart caliper ────────────────────────────────────
+            auto_caliper, sd_logit = compute_smart_caliper(ps_for_matching)
+            if caliper_mode == "Manual":
+                caliper_value = float(caliper_manual)
+            else:
+                caliper_value = auto_caliper
+                st.info(
+                    "Auto caliper computed: " + str(auto_caliper) +
+                    " (0.2 x SD of logit(PS) = " + str(sd_logit) + ")"
+                )
+
+            ci_progress.progress(40, text="Step 3/5: Matching treated and control units...")
+
+            # ── Step 2: Matching ─────────────────────────────────
+            st.markdown("---")
+            # X_raw indices must align with data_for_matching after trimming
+            if trim_support and support_summary["n_excluded"] > 0:
+                T_full = data_clean[treatment_col].astype(int).values
+                ps_treated_full = ps[T_full == 1]
+                ps_control_full = ps[T_full == 0]
+                overlap_min = max(ps_treated_full.min(), ps_control_full.min())
+                overlap_max = min(ps_treated_full.max(), ps_control_full.max())
+                in_support_mask = (ps >= overlap_min) & (ps <= overlap_max)
+                X_raw_for_matching = X_raw.iloc[in_support_mask].reset_index(drop=True)
+            else:
+                X_raw_for_matching = X_raw
+
             matched_data, balance_df = step2_matching(
-                data_clean, treatment_col, covariate_cols,
-                ps, X_raw, float(caliper), int(n_neighbors), plot_template,
+                data_for_matching, treatment_col, covariate_cols,
+                ps_for_matching, X_raw_for_matching,
+                matching_method, caliper_value, n_neighbors,
+                exact_cols, with_replacement, plot_template,
             )
 
             if matched_data is None:
-                st.error("Matching failed. Try increasing the caliper.")
+                ci_progress.empty()
                 return
 
-            # Step 3
+            n_matched = int((matched_data[treatment_col] == 1).sum())
+            match_rate = round(n_matched / n_treated_orig * 100, 1) if n_treated_orig > 0 else 0
+
+            ci_progress.progress(60, text="Step 4/5: Running outcome analysis...")
+
+            # ── Step 3: Outcome ──────────────────────────────────
             st.markdown("---")
-            step3_outcome(
+            outcome_results = step3_outcome(
                 matched_data, treatment_col, outcome_col,
                 covariate_cols, outcome_type, plot_template,
             )
 
-            # IPW
+            ate_result = None
+
+            if outcome_results:
+                # ── ATE comparison ─────────────────────────────
+                if run_ate:
+                    st.markdown("---")
+                    render_att_vs_ate(
+                        outcome_results["att_value"], outcome_results["att_pval"],
+                        outcome_results["att_ci_lo"], outcome_results["att_ci_hi"],
+                        data_clean, ps, treatment_col, outcome_col, outcome_type,
+                    )
+                    ate_result = estimate_ate(
+                        data_clean, ps, treatment_col, outcome_col, outcome_type,
+                    )
+
+            ci_progress.progress(80, text="Step 5/5: Running additional analyses...")
+
+            rosenbaum_df = None
+
+            # ── Sensitivity analysis ────────────────────────────
+            if run_sensitivity:
+                st.markdown("---")
+                bounds_df, _ = rosenbaum_bounds(
+                    matched_data, treatment_col, outcome_col, outcome_type,
+                )
+                rosenbaum_df = bounds_df
+                render_rosenbaum_section(
+                    matched_data, treatment_col, outcome_col, outcome_type, plot_template,
+                )
+
+            # ── Subgroup analysis ────────────────────────────────
+            if run_subgroup:
+                st.markdown("---")
+                render_subgroup_analysis(
+                    matched_data, treatment_col, outcome_col,
+                    outcome_type, all_cols, plot_template,
+                )
+
+            # ── Placebo test ─────────────────────────────────────
+            if run_placebo:
+                st.markdown("---")
+                render_placebo_test(
+                    matched_data, treatment_col, all_cols, outcome_col, plot_template,
+                )
+
+            # ── IPW ───────────────────────────────────────────────
             if run_ipw_also:
                 st.markdown("---")
                 run_ipw(
                     data_clean, treatment_col, outcome_col,
                     covariate_cols, ps, outcome_type, plot_template,
+                )
+
+            ci_progress.progress(100, text="Done!")
+            ci_progress.empty()
+
+            # ── Full report download ────────────────────────────
+            if outcome_results:
+                st.markdown("---")
+                st.markdown("### Download Full Causal Report")
+                html_report = generate_causal_html_report(
+                    treatment_col, outcome_col, outcome_type, matching_method,
+                    n_treated_orig, n_control_orig,
+                    round(auc_value, 4), support_summary["pct_excluded"],
+                    n_matched, match_rate, balance_df,
+                    outcome_results["att_value"], outcome_results["att_pval"],
+                    outcome_results["att_ci_lo"], outcome_results["att_ci_hi"],
+                    ate_result,
+                    rosenbaum_df,
+                )
+                st.download_button(
+                    "📥 Download Causal Inference Report (HTML)",
+                    data=html_report,
+                    file_name="causal_inference_report.html",
+                    mime="text/html",
+                    use_container_width=True,
                 )
 
         except Exception as e:

@@ -10,6 +10,54 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
+import traceback
+
+
+# ============================================================
+# Friendly error handling — show simple message, hide traceback
+# ============================================================
+ERROR_TRANSLATIONS = [
+    ("perfect separation", "Your treatment/outcome variable may be too predictable from the covariates. Try removing one strongly correlated covariate."),
+    ("singular matrix", "Some of your selected columns are too similar to each other (perfectly correlated). Try removing one of them."),
+    ("convergence", "The model could not converge with this data. Try a simpler model or fewer covariates."),
+    ("could not convert string", "One of your selected columns contains text where a number was expected. Check your column selection."),
+    ("not enough values to unpack", "There isn't enough data after removing missing values. Try a different column or fewer filters."),
+    ("division by zero", "A calculation resulted in dividing by zero — this usually means a column has no variation (all values are the same)."),
+    ("no module named", "A required library is missing on this installation. Check requirements.txt was installed correctly."),
+    ("memory", "The file may be too large for available memory. Try a smaller dataset or sample your data first."),
+    ("index out of range", "The selected columns don't have enough valid data for this analysis."),
+    ("must be exactly", "This model requires a specific number of categories in your selected column. Check the column you chose."),
+]
+
+
+def friendly_error_message(error_text):
+    """Translate common technical errors into plain language. Falls back to None."""
+    lower = str(error_text).lower()
+    for keyword, friendly in ERROR_TRANSLATIONS:
+        if keyword in lower:
+            return friendly
+    return None
+
+
+def show_friendly_error(exception, context=""):
+    """
+    Shows a simple, non-scary error message to the user,
+    with full technical details available on demand.
+    """
+    error_text = str(exception)
+    friendly = friendly_error_message(error_text)
+
+    if context:
+        st.error("Something went wrong while " + context + ".")
+    else:
+        st.error("Something went wrong while processing this step.")
+
+    if friendly:
+        st.info("Likely cause: " + friendly)
+
+    with st.expander("Show technical details (for advanced users)"):
+        st.code(error_text)
+        st.text(traceback.format_exc())
 
 # ── Module imports ───────────────────────────────────────────
 from modules.data_quality import (
@@ -74,12 +122,46 @@ st.markdown(
     div[data-testid="stMetricLabel"] { font-size: 15px; color: #475569; }
     section[data-testid="stSidebar"] { background-color: #0F172A; }
     section[data-testid="stSidebar"] * { color: #F8FAFC; }
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #FFFFFF; border-radius: 12px; padding: 12px 20px;
-        border: 1px solid #E2E8F0; color: #0F172A; font-weight: 600;
+
+    /* Main navigation (st.radio styled as horizontal tabs) */
+    div[role="radiogroup"] {
+        gap: 8px;
+        flex-wrap: wrap;
     }
-    .stTabs [aria-selected="true"] { background-color: #2563EB; color: white; }
+    div[role="radiogroup"] label {
+        background-color: #FFFFFF;
+        border-radius: 10px;
+        padding: 10px 16px;
+        border: 1px solid #E2E8F0;
+        margin-right: 0 !important;
+        transition: all 0.15s ease;
+    }
+    div[role="radiogroup"] label:hover {
+        border-color: #2563EB;
+        background-color: #F0F7FF;
+    }
+    /* Hide the circular radio indicator, keep only the text label */
+    div[role="radiogroup"] label > div[data-baseweb="radio"] > div:first-of-type {
+        width: 0;
+        height: 0;
+        margin: 0;
+        opacity: 0;
+        position: absolute;
+    }
+    div[role="radiogroup"] label div[data-testid="stMarkdownContainer"] p {
+        font-weight: 600;
+        font-size: 14px;
+        color: #0F172A;
+        margin: 0;
+    }
+    div[role="radiogroup"] label[aria-checked="true"] {
+        background-color: var(--app-primary-color, #2563EB);
+        border-color: var(--app-primary-color, #2563EB);
+    }
+    div[role="radiogroup"] label[aria-checked="true"] div[data-testid="stMarkdownContainer"] p {
+        color: #FFFFFF !important;
+    }
+
     div[data-testid="stFileUploader"] label  { color: #0F172A !important; font-weight: 700 !important; font-size: 16px !important; }
     div[data-testid="stFileUploader"] section { background-color: #F8FAFC !important; border: 2px dashed #2563EB !important; border-radius: 14px !important; }
     div[data-testid="stFileUploader"] button  { color: #FFFFFF !important; background-color: #2563EB !important; border: 1px solid #2563EB !important; font-weight: 700 !important; }
@@ -178,13 +260,26 @@ plot_template  = theme["template"]
 primary_color  = theme["primary"]
 color_scale    = theme["scale"]
 
-# تطبيق اللون على CSS
+# Light tint of the primary color, used for hover states and the guide box
+_hex = primary_color.lstrip("#")
+_r, _g, _b = int(_hex[0:2], 16), int(_hex[2:4], 16), int(_hex[4:6], 16)
+primary_color_tint = f"rgba({_r},{_g},{_b},0.08)"
+primary_color_border = f"rgba({_r},{_g},{_b},0.35)"
+
+# Apply theme color to actual UI elements
 st.markdown(
     f"""
     <style>
-    .stTabs [aria-selected="true"] {{
+    div[role="radiogroup"] label {{
+        --app-primary-color: {primary_color};
+    }}
+    div[role="radiogroup"] label:hover {{
+        border-color: {primary_color} !important;
+        background-color: {primary_color_tint} !important;
+    }}
+    div[role="radiogroup"] label[aria-checked="true"] {{
         background-color: {primary_color} !important;
-        color: white !important;
+        border-color: {primary_color} !important;
     }}
     div[data-testid="stFileUploader"] button {{
         background-color: {primary_color} !important;
@@ -192,6 +287,10 @@ st.markdown(
     }}
     .hero-container {{
         background: linear-gradient(135deg, #0F172A 0%, {primary_color} 100%) !important;
+    }}
+    .guide-box {{
+        background: {primary_color_tint} !important;
+        border: 1px solid {primary_color_border} !important;
     }}
     </style>
     """,
@@ -208,19 +307,20 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### What this app does")
 st.sidebar.markdown(
     """
-- Dataset overview & summary stats
-- Data quality checks & recommendations
-- Data cleaning & imputation
+- Dataset overview & deep column profiling
+- Data quality checks & smart recommendations
+- Statistical hypothesis tests (T-test, ANOVA, Chi-square...)
+- Data cleaning & imputation (KNN, Iterative, Multiple)
 - Outlier detection & handling
 - Interactive visualizations
 - Correlation analysis
 - Statistical modeling:
   - Linear / Logistic / Poisson / NB
-  - Survival (KM + Cox PH)
-  - Time Series + ITS *(coming soon)*
-  - Mixed Effects *(coming soon)*
-  - Causal Inference *(coming soon)*
-- Full HTML + CSV reports
+  - Survival (Kaplan-Meier + Cox PH)
+  - Time Series + Interrupted Time Series
+  - Mixed Effects (LME + GLME)
+  - Causal Inference (6 matching methods + IPW)
+- Full HTML + CSV + Excel reports
     """
 )
 
@@ -297,6 +397,13 @@ if uploaded_file is not None:
         st.sidebar.write(f"**Numeric:** {len(numeric_cols)}")
         st.sidebar.write(f"**Categorical:** {len(categorical_cols)}")
 
+        st.sidebar.markdown("---")
+        if st.sidebar.button("🔄 Start Over", use_container_width=True,
+                             help="Clear everything and remove the uploaded file."):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
         st.success("✅ File loaded. EDA report is ready.")
 
         st.markdown("## Dataset Snapshot")
@@ -317,6 +424,33 @@ if uploaded_file is not None:
         if st.session_state["df_cleaned"] is None:
             st.session_state["df_cleaned"] = df.copy()
         df_cleaned = st.session_state["df_cleaned"]
+
+        # ── First-time guidance for this file ───────────────────
+        if "guide_dismissed_for" not in st.session_state:
+            st.session_state["guide_dismissed_for"] = None
+
+        show_guide = st.session_state["guide_dismissed_for"] != file_id
+
+        if show_guide:
+            st.markdown(
+                """
+                <div class="guide-box" style="border-radius:12px;padding:16px 20px;margin-bottom:10px;">
+                <strong>New here? Suggested path:</strong><br>
+                1. <strong>Overview</strong> &mdash; see what your data looks like<br>
+                2. <strong>Data Quality</strong> &mdash; check for issues (missing values, outliers, duplicates)<br>
+                3. <strong>Data Cleaning</strong> &mdash; fix the issues found above (optional but recommended)<br>
+                4. <strong>Models</strong> &mdash; run the statistical analysis that fits your question<br><br>
+                <span style="color:#64748B;font-size:13px;">
+                Not sure which model to use? Each model tab explains when to use it
+                in an expandable "When to use this model" section.
+                </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button("Got it, hide this", key="dismiss_guide"):
+                st.session_state["guide_dismissed_for"] = file_id
+                st.rerun()
 
         # ============================================================
         # Stable navigation
@@ -564,8 +698,98 @@ if uploaded_file is not None:
             if "Remove rows" in outlier_opt:
                 st.warning("Row removal can delete many observations. Use with care.")
 
+            # ── Preview impact of destructive operations ──────────
+            is_destructive = (
+                remove_dups
+                or (drop_miss_thresh < 100)
+                or "Remove rows" in outlier_opt
+            )
+
+            if is_destructive:
+                preview_df = df.copy()
+                rows_before = len(preview_df)
+
+                if remove_dups:
+                    preview_df = preview_df.drop_duplicates()
+
+                if drop_miss_thresh < 100:
+                    pct_missing = preview_df.isnull().mean() * 100
+                    cols_to_drop = pct_missing[pct_missing > drop_miss_thresh].index.tolist()
+                else:
+                    cols_to_drop = []
+
+                rows_after_dedup = len(preview_df)
+
+                if "Remove rows" in outlier_opt and numeric_cols:
+                    preview_outlier_cols = [c for c in numeric_cols if c in preview_df.columns]
+                    if "Z-Score" in outlier_opt:
+                        for col in preview_outlier_cols:
+                            s = preview_df[col].dropna()
+                            if len(s) > 0 and s.std() > 0:
+                                z = (preview_df[col] - s.mean()).abs() / s.std()
+                                preview_df = preview_df[preview_df[col].isna() | (z <= z_clean)]
+                    else:
+                        for col in preview_outlier_cols:
+                            s = preview_df[col].dropna()
+                            if len(s) > 0:
+                                q1, q3 = s.quantile(0.25), s.quantile(0.75)
+                                iqr = q3 - q1
+                                lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                                preview_df = preview_df[
+                                    preview_df[col].isna() | preview_df[col].between(lower, upper)
+                                ]
+
+                rows_after_all = len(preview_df)
+                rows_lost = rows_before - rows_after_all
+                pct_lost = round(rows_lost / rows_before * 100, 1) if rows_before > 0 else 0
+
+                st.markdown("### Preview Impact")
+                pv1, pv2, pv3 = st.columns(3)
+                pv1.metric("Rows before", f"{rows_before:,}")
+                pv2.metric("Rows after", f"{rows_after_all:,}")
+                pv3.metric(
+                    "Rows that will be removed",
+                    f"{rows_lost:,} ({pct_lost}%)",
+                )
+
+                if cols_to_drop:
+                    st.warning(
+                        "Columns that will be dropped (missing % above threshold): "
+                        + ", ".join(cols_to_drop)
+                    )
+
+                if pct_lost > 30:
+                    st.error(
+                        "This will remove more than 30% of your rows ("
+                        + str(pct_lost) + "%). Review your settings before proceeding."
+                    )
+                elif pct_lost > 10:
+                    st.warning(
+                        "This will remove " + str(pct_lost) + "% of your rows. "
+                        "Double-check this is intended."
+                    )
+                elif rows_lost > 0:
+                    st.info(
+                        str(rows_lost) + " row(s) will be removed ("
+                        + str(pct_lost) + "%)."
+                    )
+
+                confirm_destructive = st.checkbox(
+                    "I reviewed the impact above and want to proceed",
+                    key="cl_confirm_destructive",
+                )
+            else:
+                confirm_destructive = True
+
             st.markdown("---")
-            if st.button("▶ Apply Cleaning", use_container_width=True):
+            apply_disabled = is_destructive and not confirm_destructive
+            if apply_disabled:
+                st.caption("Check the confirmation box above to enable this button.")
+
+            if st.button(
+                "▶ Apply Cleaning", use_container_width=True,
+                disabled=apply_disabled,
+            ):
                 with st.spinner("Applying cleaning and imputation…"):
                     result = clean_dataset(
                         df=df,
@@ -1476,8 +1700,7 @@ if uploaded_file is not None:
             st.dataframe(df.head(rows_show), use_container_width=True)
 
     except Exception as e:
-        st.error("An error occurred while processing the file.")
-        st.exception(e)
+        show_friendly_error(e, context="processing this file")
 
 else:
     st.info("Upload a CSV or Excel file from the sidebar to start your analysis.")

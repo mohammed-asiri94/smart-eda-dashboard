@@ -676,6 +676,21 @@ def render_survival_tab(df, df_cleaned, plot_template):
             key="surv_event",
             help="Must be binary: 1 = event, 0 = censored.",
         )
+
+        # ── Immediate readiness check ────────────────────────
+        unique_event_vals = mdf[event_col].dropna().unique()
+        if not set(unique_event_vals).issubset({0, 1, True, False}):
+            st.warning(
+                "This column has values " + str(sorted(unique_event_vals)[:5]) +
+                " — Event column should be binary (0/1). "
+                "Choose a different column or recode this one first."
+            )
+
+        if (mdf[duration_col].dropna() < 0).any():
+            st.warning(
+                "Duration column '" + duration_col + "' contains negative values, "
+                "which is not valid for survival analysis."
+            )
     with s3:
         group_options = ["None"] + [c for c in all_cols
                                     if c not in (duration_col, event_col)]

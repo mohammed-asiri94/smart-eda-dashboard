@@ -192,8 +192,18 @@ init_session_state()
 
 
 # ============================================================
-# File reading helpers
+# File reading helpers — broad format support
 # ============================================================
+SUPPORTED_EXTENSIONS = [
+    "csv", "tsv", "txt",
+    "xlsx", "xls", "ods",
+    "json", "parquet", "feather", "pkl", "pickle",
+    "sav", "sas7bdat", "dta",
+    "rdata", "rds", "rda",
+    "html",
+]
+
+
 def get_excel_sheet_names(uploaded_file):
     name = uploaded_file.name.lower()
     if name.endswith((".xlsx", ".xls")):
@@ -201,13 +211,122 @@ def get_excel_sheet_names(uploaded_file):
     return None
 
 
+def _detect_delimiter(file_bytes):
+    """Try to detect delimiter for txt/csv-like files."""
+    sample = file_bytes[:5000].decode("utf-8", errors="ignore")
+    counts = {
+        ",": sample.count(","),
+        ";": sample.count(";"),
+        "\t": sample.count("\t"),
+        "|": sample.count("|"),
+    }
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ","
+
+
+def _first_dataframe_from_dict(result_dict):
+    """Helper for pyreadr results which return an OrderedDict of dataframes."""
+    if not result_dict:
+        raise ValueError("No data frames found inside the R file.")
+    return list(result_dict.values())[0]
+
+
 @st.cache_data
 def load_dataframe(file_bytes, file_name, sheet_name=None):
-    if file_name.endswith(".csv"):
+    name = file_name.lower()
+
+    # ── Plain text / delimited ──────────────────────────────
+    if name.endswith(".csv"):
         return pd.read_csv(BytesIO(file_bytes))
-    elif file_name.endswith((".xlsx", ".xls")):
+
+    elif name.endswith(".tsv"):
+        return pd.read_csv(BytesIO(file_bytes), sep="\t")
+
+    elif name.endswith(".txt"):
+        delim = _detect_delimiter(file_bytes)
+        return pd.read_csv(BytesIO(file_bytes), sep=delim, engine="python")
+
+    # ── Spreadsheets ─────────────────────────────────────────
+    elif name.endswith((".xlsx", ".xls")):
         return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
-    raise ValueError("Unsupported file type. Please upload CSV, XLSX, or XLS.")
+
+    elif name.endswith(".ods"):
+        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, engine="odf")
+
+    # ── JSON ─────────────────────────────────────────────────
+    elif name.endswith(".json"):
+        try:
+            return pd.read_json(BytesIO(file_bytes))
+        except ValueError:
+            return pd.read_json(BytesIO(file_bytes), lines=True)
+
+    # ── Columnar binary formats ──────────────────────────────
+    elif name.endswith(".parquet"):
+        return pd.read_parquet(BytesIO(file_bytes))
+
+    elif name.endswith(".feather"):
+        return pd.read_feather(BytesIO(file_bytes))
+
+    elif name.endswith((".pkl", ".pickle")):
+        obj = pd.read_pickle(BytesIO(file_bytes))
+        if isinstance(obj, pd.DataFrame):
+            return obj
+        return pd.DataFrame(obj)
+
+    # ── Statistical software formats ────────────────────────
+    elif name.endswith(".sav"):
+        import pyreadstat
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".sav", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            df, meta = pyreadstat.read_sav(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+        return df
+
+    elif name.endswith(".sas7bdat"):
+        import pyreadstat
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".sas7bdat", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            df, meta = pyreadstat.read_sas7bdat(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+        return df
+
+    elif name.endswith(".dta"):
+        return pd.read_stata(BytesIO(file_bytes))
+
+    # ── R data files ─────────────────────────────────────────
+    elif name.endswith((".rdata", ".rds", ".rda")):
+        import pyreadr
+        import tempfile, os
+        suffix = ".rds" if name.endswith(".rds") else ".RData"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            result = pyreadr.read_r(tmp_path)
+            df = _first_dataframe_from_dict(result)
+        finally:
+            os.unlink(tmp_path)
+        return df
+
+    # ── HTML tables ──────────────────────────────────────────
+    elif name.endswith(".html"):
+        tables = pd.read_html(BytesIO(file_bytes))
+        if not tables:
+            raise ValueError("No tables found in the HTML file.")
+        return tables[0]
+
+    raise ValueError(
+        "Unsupported file type. Please upload one of: "
+        + ", ".join(SUPPORTED_EXTENSIONS)
+    )
 
 
 # ============================================================
@@ -233,10 +352,30 @@ st.markdown(
 st.sidebar.markdown("## 📊 Smart EDA")
 
 uploaded_file = st.file_uploader(
-    "Upload your dataset (CSV or Excel)",
-    type=["csv", "xlsx", "xls"],
+    "Upload your dataset",
+    type=SUPPORTED_EXTENSIONS,
     key="main_uploader",
     label_visibility="collapsed",
+)
+
+# Hide Streamlit's auto-generated "Limit XXXMB • type1, type2..." text
+# (it only shows the first 3 of 17 supported formats, which is misleading)
+# and replace it with a simple, accurate message.
+st.markdown(
+    """
+    <style>
+    [data-testid="stFileUploaderDropzoneInstructions"] span,
+    [data-testid="stFileUploaderDropzoneInstructions"] small {
+        display: none !important;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"]::after {
+        content: "All formats supported";
+        font-size: 14px;
+        color: #64748B;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 st.sidebar.markdown("---")
@@ -1703,7 +1842,7 @@ if uploaded_file is not None:
         show_friendly_error(e, context="processing this file")
 
 else:
-    st.info("Upload a CSV or Excel file from the sidebar to start your analysis.")
+    st.info("Upload a file to start your analysis.")
     st.markdown("## What you get after uploading")
     p1, p2, p3 = st.columns(3)
     with p1:

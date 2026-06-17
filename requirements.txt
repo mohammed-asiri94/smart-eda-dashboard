@@ -11,9 +11,22 @@ numpy>=1.26.0
 plotly>=5.18.0
 matplotlib>=3.8.0
 
-# File formats
+# File formats — spreadsheets
 openpyxl>=3.1.0
 xlrd>=2.0.1
+odfpy>=1.4.1
+
+# File formats — columnar / binary
+pyarrow>=15.0.0
+
+# File formats — statistical software
+pyreadstat>=1.2.6
+pyreadr>=0.5.0
+
+# HTML table parsing
+lxml>=5.0.0
+html5lib>=1.1
+beautifulsoup4>=4.12.0
 
 # Machine learning / imputation
 scikit-learn>=1.4.0
@@ -26,13 +39,6 @@ lifelines>=0.27.0
 
 # Time series
 pmdarima>=2.0.4
-statsmodels>=0.14.0   # ADF, KPSS, ARIMA — already included above
 
 # Causal inference
 causalinference>=0.1.3
-
-# Excel export
-openpyxl>=3.1.0       # already included above
-
-# Optional: faster parquet support
-# pyarrow>=15.0.0

@@ -73,38 +73,78 @@ def _match_psm(ps, treated_idx, control_idx, caliper, n_neighbors, with_replacem
     """
     Nearest Neighbor matching on propensity score.
     Supports: 1:1, 1:k, with/without replacement.
+
+    Searches the FULL control pool for every treated unit (no artificial
+    candidate-pool shortcut). Treated units are processed from highest to
+    lowest propensity score, matching the default convention used by R's
+    MatchIt package.
+
+    caliper=None means no distance restriction at all (every treated unit
+    is matched to its nearest available control(s) regardless of distance),
+    matching MatchIt's behaviour when no caliper is specified.
     """
-    ps_treated = ps[treated_idx].reshape(-1, 1)
-    ps_control = ps[control_idx].reshape(-1, 1)
-
     k = max(n_neighbors, 1)
-    search_k = min(len(control_idx), k * 5) if not with_replacement else k
+    ps_treated_vals = ps[treated_idx]
+    ps_control_vals = ps[control_idx]
+    n_control = len(control_idx)
 
-    nn = NearestNeighbors(n_neighbors=search_k, metric="euclidean")
-    nn.fit(ps_control)
-    distances, indices = nn.kneighbors(ps_treated)
+    # Process treated units from highest to lowest propensity score
+    order = np.argsort(-ps_treated_vals)
 
     matched_treated = []
     matched_control = []
-    used_control = set()
     unmatched = 0
 
-    for i, (dists, idxs) in enumerate(zip(distances, indices)):
-        valid = [(d, idx) for d, idx in zip(dists, idxs) if d <= caliper]
+    if with_replacement:
+        # Controls can be reused across treated units - no bookkeeping needed.
+        for pos in order:
+            t_idx = treated_idx[pos]
+            dists = np.abs(ps_control_vals - ps_treated_vals[pos])
+            candidates = np.arange(n_control) if caliper is None else np.where(dists <= caliper)[0]
 
-        if not with_replacement:
-            valid = [(d, idx) for d, idx in valid if idx not in used_control]
+            if len(candidates) == 0:
+                unmatched += 1
+                continue
 
-        if not valid:
-            unmatched += 1
-            continue
+            take = min(k, len(candidates))
+            nearest = candidates[np.argpartition(dists[candidates], take - 1)[:take]]
+            nearest = nearest[np.argsort(dists[nearest])]
 
-        chosen = valid[:k]
-        for d, idx in chosen:
-            matched_treated.append(treated_idx[i])
-            matched_control.append(control_idx[idx])
-            if not with_replacement:
-                used_control.add(idx)
+            for c_local in nearest:
+                matched_treated.append(t_idx)
+                matched_control.append(control_idx[c_local])
+    else:
+        # Without replacement: maintain a mask of controls not yet used and
+        # search only among the controls that remain available.
+        used = np.zeros(n_control, dtype=bool)
+
+        for pos in order:
+            t_idx = treated_idx[pos]
+            avail_local = np.where(~used)[0]
+
+            if len(avail_local) == 0:
+                unmatched += 1
+                continue
+
+            dists_avail = np.abs(ps_control_vals[avail_local] - ps_treated_vals[pos])
+            candidates = (
+                np.arange(len(avail_local)) if caliper is None
+                else np.where(dists_avail <= caliper)[0]
+            )
+
+            if len(candidates) == 0:
+                unmatched += 1
+                continue
+
+            take = min(k, len(candidates))
+            nearest_in_cand = candidates[np.argpartition(dists_avail[candidates], take - 1)[:take]]
+            nearest_in_cand = nearest_in_cand[np.argsort(dists_avail[nearest_in_cand])]
+            chosen_local = avail_local[nearest_in_cand]
+            used[chosen_local] = True
+
+            for c_local in chosen_local:
+                matched_treated.append(t_idx)
+                matched_control.append(control_idx[c_local])
 
     return matched_treated, matched_control, unmatched
 
@@ -240,7 +280,7 @@ def compute_smart_caliper(ps, multiplier=0.2):
 # Step 1: Propensity Score Estimation
 # ============================================================
 
-def step1_propensity_score(data, treatment_col, covariate_cols, plot_template):
+def step1_propensity_score(data, treatment_col, covariate_cols, plot_template, ps_method="sklearn"):
     st.markdown("## Step 1: Propensity Score Estimation")
     st.caption(
         "Propensity score = probability of receiving treatment given covariates. "
@@ -262,15 +302,25 @@ def step1_propensity_score(data, treatment_col, covariate_cols, plot_template):
 
     T = data[treatment_col].astype(int).values
     X = X_raw.values
+    feat_names = list(X_raw.columns)
 
-    # Scale
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    if ps_method == "statsmodels":
+        # Unregularized, unscaled logistic regression - matches R's glm()
+        # used by MatchIt internally for distance = "logit".
+        X_const = sm.add_constant(X_raw.astype(float), has_constant="add")
+        glm_fit = sm.Logit(T, X_const).fit(disp=False)
+        ps = glm_fit.predict(X_const).values
+        coefs = glm_fit.params.drop("const").values
+    else:
+        # Scale
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
 
-    # ── Fit Logistic ──────────────────────────────────────────
-    lr = LogisticRegression(max_iter=1000, random_state=42, C=1.0)
-    lr.fit(X_scaled, T)
-    ps = lr.predict_proba(X_scaled)[:, 1]
+        # ── Fit Logistic ──────────────────────────────────────
+        lr = LogisticRegression(max_iter=1000, random_state=42, C=1.0)
+        lr.fit(X_scaled, T)
+        ps = lr.predict_proba(X_scaled)[:, 1]
+        coefs = lr.coef_[0]
 
     auc = roc_auc_score(T, ps)
     st.metric("AUC of Propensity Score Model", round(auc, 4),
@@ -354,11 +404,10 @@ def step1_propensity_score(data, treatment_col, covariate_cols, plot_template):
 
     # ── Coefficient table ──────────────────────────────────────
     st.markdown("### Propensity Score Model Coefficients")
-    feat_names = list(X_raw.columns)
     coef_df = pd.DataFrame({
         "Covariate":    feat_names,
-        "Coefficient":  [round(float(c), 4) for c in lr.coef_[0]],
-        "Odds Ratio":   [round(float(np.exp(c)), 4) for c in lr.coef_[0]],
+        "Coefficient":  [round(float(c), 4) for c in coefs],
+        "Odds Ratio":   [round(float(np.exp(c)), 4) for c in coefs],
     }).sort_values("Odds Ratio", ascending=False)
     st.dataframe(coef_df, use_container_width=True)
 
@@ -539,7 +588,7 @@ def step2_matching(data, treatment_col, covariate_cols, ps, X_raw,
 
     elif matching_method == "Mahalanobis Distance":
         # caliper here is interpreted on Mahalanobis scale; use a generous default if too small
-        md_caliper = max(caliper * 10, 1.0)
+        md_caliper = np.inf if caliper is None else max(caliper * 10, 1.0)
         matched_treated, matched_control, unmatched = _match_mahalanobis(
             X_raw, treated_idx, control_idx, md_caliper, with_replacement,
         )
@@ -562,6 +611,12 @@ def step2_matching(data, treatment_col, covariate_cols, ps, X_raw,
     matched_data = data.iloc[matched_idx].copy()
     matched_ps   = ps[matched_idx]
 
+    # Pair id: every matched control shares the pair id of the treated unit
+    # it was matched to. This lets the outcome model use cluster-robust SEs
+    # that account for the within-pair correlation created by k:1 matching.
+    matched_data["_pair_id"] = matched_treated + matched_treated
+    matched_data = matched_data.reset_index(drop=True)
+
     n_matched = len(matched_treated)
     match_rate = round(n_matched / n_treated * 100, 1)
 
@@ -570,6 +625,15 @@ def step2_matching(data, treatment_col, covariate_cols, ps, X_raw,
     m2.metric("Unmatched treated", unmatched)
     m3.metric("Match rate",        str(match_rate) + "%")
     m4.metric("Method",            matching_method.split(" (")[0])
+
+    st.download_button(
+        "📥 Download matched dataset (CSV)",
+        data=matched_data.drop(columns=["_pair_id"]).to_csv(index=False).encode(),
+        file_name="matched_dataset.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="ci_download_matched",
+    )
 
     if match_rate < 70:
         issues.append({
@@ -698,7 +762,8 @@ def step2_matching(data, treatment_col, covariate_cols, ps, X_raw,
 # ============================================================
 
 def step3_outcome(matched_data, treatment_col, outcome_col,
-                  covariate_cols, outcome_type, plot_template):
+                  covariate_cols, outcome_type, plot_template,
+                  adjust_for_covariates=True, cluster_se=False):
     st.markdown("## Step 3: Outcome Analysis After Matching")
     st.caption(
         "Regression on the matched sample. "
@@ -716,25 +781,34 @@ def step3_outcome(matched_data, treatment_col, outcome_col,
     )
 
     # ── Build formula ─────────────────────────────────────────
-    # Treatment + adjusted covariates (doubly robust)
+    # adjust_for_covariates=True -> treatment + covariates (doubly robust)
+    # adjust_for_covariates=False -> treatment only (matches the classic
+    # textbook "unadjusted regression on the matched sample" estimator)
     cat_cols = data[covariate_cols].select_dtypes(
         include=["object", "category", "bool"]
     ).columns.tolist()
 
     parts = [_quote(treatment_col)]
-    for col in covariate_cols:
-        if col in cat_cols:
-            parts.append("C(" + _quote(col) + ")")
-        else:
-            parts.append(_quote(col))
+    if adjust_for_covariates:
+        for col in covariate_cols:
+            if col in cat_cols:
+                parts.append("C(" + _quote(col) + ")")
+            else:
+                parts.append(_quote(col))
 
     formula = _quote(outcome_col) + " ~ " + " + ".join(parts)
     st.code(formula, language="text")
 
+    # ── Cluster-robust SE setup (accounts for k:1 matched pairs) ──
+    fit_kwargs = {}
+    if cluster_se and "_pair_id" in data.columns:
+        fit_kwargs = {"cov_type": "cluster", "cov_kwds": {"groups": data["_pair_id"]}}
+        st.caption("Standard errors are clustered by matched pair.")
+
     # ── Fit outcome model ─────────────────────────────────────
     try:
         if outcome_type == "Continuous":
-            result = smf.ols(formula=formula, data=data).fit()
+            result = smf.ols(formula=formula, data=data).fit(**fit_kwargs)
             model_name = "Linear Regression"
 
         elif outcome_type == "Binary":
@@ -744,25 +818,25 @@ def step3_outcome(matched_data, treatment_col, outcome_col,
                 data[outcome_col] = data[outcome_col].map(
                     {sorted_cls[0]: 0, sorted_cls[1]: 1}
                 )
-            result = smf.logit(formula=formula, data=data).fit(disp=False)
+            result = smf.logit(formula=formula, data=data).fit(disp=False, **fit_kwargs)
             model_name = "Logistic Regression"
 
         elif outcome_type == "Count":
             result = smf.glm(
                 formula=formula, data=data,
                 family=sm.families.Poisson()
-            ).fit()
+            ).fit(**fit_kwargs)
             model_name = "Poisson Regression"
 
         elif outcome_type == "Count (overdispersed)":
             result = smf.glm(
                 formula=formula, data=data,
                 family=sm.families.NegativeBinomial()
-            ).fit()
+            ).fit(**fit_kwargs)
             model_name = "Negative Binomial Regression"
 
         else:
-            result = smf.ols(formula=formula, data=data).fit()
+            result = smf.ols(formula=formula, data=data).fit(**fit_kwargs)
             model_name = "Linear Regression"
 
     except Exception as e:
@@ -854,6 +928,16 @@ def step3_outcome(matched_data, treatment_col, outcome_col,
         "CI Upper":    [round(float(x), 4) for x in ci_hi_list],
         "Significant": ["YES" if float(p) < 0.05 else "NO" for p in pvals_list],
     })
+
+    if outcome_type == "Binary":
+        coef_tbl["Odds Ratio"]  = [round(float(np.exp(x)), 4) for x in params_list]
+        coef_tbl["OR CI Lower"] = [round(float(np.exp(x)), 4) for x in ci_lo_list]
+        coef_tbl["OR CI Upper"] = [round(float(np.exp(x)), 4) for x in ci_hi_list]
+    elif outcome_type in ("Count", "Count (overdispersed)"):
+        coef_tbl["IRR"]         = [round(float(np.exp(x)), 4) for x in params_list]
+        coef_tbl["IRR CI Lower"] = [round(float(np.exp(x)), 4) for x in ci_lo_list]
+        coef_tbl["IRR CI Upper"] = [round(float(np.exp(x)), 4) for x in ci_hi_list]
+
     st.dataframe(coef_tbl, use_container_width=True)
 
     st.download_button(
@@ -1644,6 +1728,18 @@ def render_causal_tab(df, df_cleaned, plot_template):
         help="Variables that affect both treatment assignment and outcome.",
     )
 
+    ps_method_choice = st.radio(
+        "Propensity score model",
+        [
+            "Logistic Regression (scikit-learn, standardized + L2)",
+            "Logistic Regression (statsmodels, unregularized - matches R's glm())",
+        ],
+        key="ci_ps_method",
+        help="Use the statsmodels option if you need to compare results "
+             "directly against an R analysis using glm().",
+    )
+    ps_method = "statsmodels" if ps_method_choice.startswith("Logistic Regression (statsmodels") else "sklearn"
+
     # ── Matching method selection ─────────────────────────────
     st.markdown("### Matching Method")
 
@@ -1702,8 +1798,15 @@ def render_causal_tab(df, df_cleaned, plot_template):
     with cal1:
         caliper_mode = st.radio(
             "Caliper mode",
-            ["Auto (0.2 x SD of logit(PS))", "Manual"],
+            [
+                "Auto (0.2 x SD of logit(PS))",
+                "Manual",
+                "No caliper (match to nearest available, regardless of distance)",
+            ],
             key="ci_caliper_mode",
+            help="'No caliper' reproduces R's MatchIt default when no caliper "
+                 "argument is supplied: every treated unit is matched to its "
+                 "nearest available control(s) no matter how far away it is.",
         )
     with cal2:
         if caliper_mode == "Manual":
@@ -1713,6 +1816,9 @@ def render_causal_tab(df, df_cleaned, plot_template):
                 value=0.2, step=0.01,
                 key="ci_caliper_manual",
             )
+        elif caliper_mode.startswith("No caliper"):
+            caliper_manual = None
+            st.caption("No distance limit - every treated unit will be matched to its nearest available control(s).")
         else:
             caliper_manual = None
             st.caption("Caliper will be computed automatically after propensity scores are estimated.")
@@ -1723,6 +1829,25 @@ def render_causal_tab(df, df_cleaned, plot_template):
         value=True, key="ci_trim_support",
         help="Recommended. Removes units with no realistic comparison in the other group.",
     )
+
+    # ── Outcome model settings ──────────────────────────────────
+    st.markdown("### Outcome Model Settings")
+    om1, om2 = st.columns(2)
+    with om1:
+        adjust_outcome_model = st.checkbox(
+            "Adjust outcome model for covariates (doubly-robust)",
+            value=True, key="ci_adjust_outcome",
+            help="Unchecked: fits outcome ~ treatment only on the matched sample "
+                 "(the classic textbook matched-sample estimator). "
+                 "Checked: also adjusts for the covariates listed above.",
+        )
+    with om2:
+        cluster_se = st.checkbox(
+            "Cluster-robust standard errors (cluster by matched pair)",
+            value=True, key="ci_cluster_se",
+            help="Recommended for k:1 matching, since matched controls within "
+                 "the same pair are not independent observations.",
+        )
 
     # ── IPW + extras ───────────────────────────────────────────
     st.markdown("### Additional Analyses")
@@ -1806,7 +1931,8 @@ def render_causal_tab(df, df_cleaned, plot_template):
             # ── Step 1 ──────────────────────────────────────────
             st.markdown("---")
             ps, X_raw, ps_issues = step1_propensity_score(
-                data_clean, treatment_col, covariate_cols, plot_template
+                data_clean, treatment_col, covariate_cols, plot_template,
+                ps_method=ps_method,
             )
 
             auc_value = float(roc_auc_score(
@@ -1830,6 +1956,9 @@ def render_causal_tab(df, df_cleaned, plot_template):
             auto_caliper, sd_logit = compute_smart_caliper(ps_for_matching)
             if caliper_mode == "Manual":
                 caliper_value = float(caliper_manual)
+            elif caliper_mode.startswith("No caliper"):
+                caliper_value = None
+                st.info("No caliper applied - matching to the nearest available control(s) regardless of distance.")
             else:
                 caliper_value = auto_caliper
                 st.info(
@@ -1874,6 +2003,8 @@ def render_causal_tab(df, df_cleaned, plot_template):
             outcome_results = step3_outcome(
                 matched_data, treatment_col, outcome_col,
                 covariate_cols, outcome_type, plot_template,
+                adjust_for_covariates=adjust_outcome_model,
+                cluster_se=cluster_se,
             )
 
             ate_result = None

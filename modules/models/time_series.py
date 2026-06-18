@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from scipy import stats
 import warnings
 
@@ -19,6 +20,7 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.stats.stattools import durbin_watson
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.stats.outliers_influence import OLSInfluence
 import statsmodels.api as sm
 import pmdarima as pm
 
@@ -233,8 +235,6 @@ def run_time_series(series, freq, plot_template):
                 period=period
             )
 
-            fig_decomp = go.Figure()
-
             components = [
                 ("Observed", series.dropna().values, "#2563EB"),
                 ("Trend", decomp.trend.values, "#16A34A"),
@@ -244,6 +244,13 @@ def run_time_series(series, freq, plot_template):
 
             decomp_index = series.dropna().index
 
+            fig_decomp = make_subplots(
+                rows=4, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.04,
+                subplot_titles=[name for name, _, _ in components],
+            )
+
             for i, (name, vals, color) in enumerate(components):
                 fig_decomp.add_trace(
                     go.Scatter(
@@ -252,20 +259,20 @@ def run_time_series(series, freq, plot_template):
                         mode="lines",
                         name=name,
                         line=dict(color=color, width=1.5),
-                        visible=True if i == 0 else "legendonly",
-                    )
+                        showlegend=False,
+                    ),
+                    row=i + 1, col=1,
                 )
 
             fig_decomp.update_layout(
                 title=f"Decomposition ({decomp_model})",
-                xaxis_title="Time",
-                yaxis_title="Value",
                 template=plot_template,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                height=700,
+                margin=dict(t=80),
             )
+            fig_decomp.update_xaxes(title_text="Time", row=4, col=1)
 
             st.plotly_chart(fig_decomp, use_container_width=True)
-            st.caption("Click legend items to show or hide components.")
 
         except Exception as e:
             st.warning(f"Decomposition failed: {e}")
@@ -601,6 +608,153 @@ def run_time_series(series, freq, plot_template):
 # ============================================================
 # Interrupted Time Series (ITS)
 # ============================================================
+
+def render_ols_diagnostic_plots(result, plot_template):
+    """
+    Renders the four classic OLS regression diagnostic plots
+    (matching R's plot(lm_model)): Residuals vs Fitted, Q-Q Residuals,
+    Scale-Location, and Residuals vs Leverage (with Cook's distance).
+    Only applicable to OLS-based models like the Segmented Regression
+    ITS — not meaningful for ARIMA, which has its own residual checks.
+    """
+    st.markdown("### 📐 Regression Diagnostic Plots")
+    st.caption(
+        "Four standard checks for linear regression models — matching "
+        "R's plot(lm_model). These are specific to OLS-based models "
+        "(Segmented Regression) and are not shown for ARIMA, which uses "
+        "different residual diagnostics (Ljung-Box, Durbin-Watson above)."
+    )
+
+    try:
+        influence = OLSInfluence(result)
+        fitted = np.asarray(result.fittedvalues)
+        resid = np.asarray(result.resid)
+        std_resid = np.asarray(influence.resid_studentized_internal)
+        leverage = np.asarray(influence.hat_matrix_diag)
+        cooks_d = np.asarray(influence.cooks_distance[0])
+        n = len(resid)
+    except Exception as e:
+        st.info(f"Diagnostic plots could not be computed: {e}")
+        return
+
+    cooks_threshold = 4 / n
+    high_cooks_idx = np.where(cooks_d > cooks_threshold)[0]
+
+    col_a, col_b = st.columns(2)
+
+    # ── 1. Residuals vs Fitted ──────────────────────────────────
+    with col_a:
+        st.markdown("**Residuals vs Fitted**")
+        st.caption("Checks linearity. The smoothed line should stay flat near zero.")
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(
+            x=fitted, y=resid, mode="markers",
+            marker=dict(size=5, color="#2563EB", opacity=0.6),
+            name="Residuals",
+        ))
+        try:
+            sort_idx = np.argsort(fitted)
+            frac = max(0.3, min(0.9, 20 / n))
+            lowess = sm.nonparametric.lowess(resid, fitted, frac=frac)
+            fig1.add_trace(go.Scatter(
+                x=lowess[:, 0], y=lowess[:, 1], mode="lines",
+                line=dict(color="#DC2626", width=2), name="Trend",
+            ))
+        except Exception:
+            pass
+        fig1.add_hline(y=0, line_dash="dash", line_color="grey")
+        fig1.update_layout(
+            xaxis_title="Fitted values", yaxis_title="Residuals",
+            template=plot_template, height=350,
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+    # ── 2. Q-Q Residuals ─────────────────────────────────────────
+    with col_b:
+        st.markdown("**Q-Q Residuals**")
+        st.caption("Checks normality. Points should follow the dashed line closely.")
+        osm, osr = stats.probplot(std_resid)[0]
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=list(osm), y=list(osr), mode="markers",
+            marker=dict(size=5, color="#2563EB", opacity=0.6),
+            name="Residuals",
+        ))
+        fig2.add_trace(go.Scatter(
+            x=[min(osm), max(osm)], y=[min(osm), max(osm)],
+            mode="lines", line=dict(color="#DC2626", dash="dash"),
+            name="Normal line",
+        ))
+        fig2.update_layout(
+            xaxis_title="Theoretical Quantiles", yaxis_title="Standardized Residuals",
+            template=plot_template, height=350,
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    col_c, col_d = st.columns(2)
+
+    # ── 3. Scale-Location ────────────────────────────────────────
+    with col_c:
+        st.markdown("**Scale-Location**")
+        st.caption("Checks equal variance (homoscedasticity). Flat line = stable variance.")
+        sqrt_std_resid = np.sqrt(np.abs(std_resid))
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(
+            x=fitted, y=sqrt_std_resid, mode="markers",
+            marker=dict(size=5, color="#2563EB", opacity=0.6),
+            name="√|Standardized residuals|",
+        ))
+        try:
+            frac = max(0.3, min(0.9, 20 / n))
+            lowess3 = sm.nonparametric.lowess(sqrt_std_resid, fitted, frac=frac)
+            fig3.add_trace(go.Scatter(
+                x=lowess3[:, 0], y=lowess3[:, 1], mode="lines",
+                line=dict(color="#DC2626", width=2), name="Trend",
+            ))
+        except Exception:
+            pass
+        fig3.update_layout(
+            xaxis_title="Fitted values", yaxis_title="√|Standardized residuals|",
+            template=plot_template, height=350,
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # ── 4. Residuals vs Leverage (Cook's Distance) ────────────────
+    with col_d:
+        st.markdown("**Residuals vs Leverage**")
+        st.caption("Flags influential points. Watch for points beyond Cook's distance.")
+        fig4 = go.Figure()
+        point_colors = ["#DC2626" if cd > cooks_threshold else "#2563EB" for cd in cooks_d]
+        fig4.add_trace(go.Scatter(
+            x=leverage, y=std_resid, mode="markers",
+            marker=dict(size=5, color=point_colors, opacity=0.7),
+            name="Standardized residuals",
+        ))
+        fig4.add_hline(y=0, line_dash="dash", line_color="grey")
+        fig4.update_layout(
+            xaxis_title="Leverage", yaxis_title="Standardized Residuals",
+            template=plot_template, height=350,
+        )
+        st.plotly_chart(fig4, use_container_width=True)
+
+    # ── Influential points summary ────────────────────────────────
+    if len(high_cooks_idx) > 0:
+        st.warning(
+            f"🟡 {len(high_cooks_idx)} observation(s) exceed the Cook's distance "
+            f"threshold (4/n = {cooks_threshold:.4f}), shown in red on the Leverage "
+            f"plot. These points have an outsized influence on the model — "
+            f"review them for data entry errors or genuine extreme events."
+        )
+        influence_tbl = pd.DataFrame({
+            "Observation index": high_cooks_idx,
+            "Cook's Distance": np.round(cooks_d[high_cooks_idx], 5),
+            "Leverage": np.round(leverage[high_cooks_idx], 4),
+            "Std. Residual": np.round(std_resid[high_cooks_idx], 3),
+        }).sort_values("Cook's Distance", ascending=False)
+        st.dataframe(influence_tbl, use_container_width=True)
+    else:
+        st.success("✅ No observations exceed the Cook's distance threshold.")
+
 
 def run_its(series, intervention_point, plot_template, control_series=None, lag_k=0,
             adjust_seasonality=False, seasonal_freq=None):
@@ -1168,6 +1322,8 @@ def run_its(series, intervention_point, plot_template, control_series=None, lag_
 
     except Exception as e:
         st.info(f"Residual stationarity check could not be completed: {e}")
+
+    render_ols_diagnostic_plots(result, plot_template)
 
     st.markdown("### 🩺 Diagnostic Summary")
     _diagnostic_summary(issues)
@@ -1998,14 +2154,32 @@ def render_time_series_tab(df, df_cleaned, plot_template):
         st.warning("No usable rows after removing missing values from the selected time/value columns.")
         return
 
+    date_conversion_succeeded = False
     try:
-        ts_df[time_col] = pd.to_datetime(ts_df[time_col])
+        converted_dates = pd.to_datetime(ts_df[time_col], errors="raise")
+        ts_df[time_col] = converted_dates
+        date_conversion_succeeded = True
     except Exception:
-        pass
+        date_conversion_succeeded = False
 
-    try:
+    if date_conversion_succeeded:
+        # Safe to sort chronologically using the parsed datetime values.
         ts_df = ts_df.sort_values(time_col).set_index(time_col)
-    except Exception:
+    else:
+        # Date parsing failed (e.g. mixed/ambiguous formats like "Jan-00"
+        # and "5-Oct" in the same column). Sorting the raw strings would
+        # scramble the chronological order (alphabetical instead of
+        # time-based), which silently corrupts every downstream model.
+        # The safest fallback is to preserve the file's original row
+        # order, which is almost always already chronological for time
+        # series data — exactly like keeping seq_len(nrow(df)) in R
+        # instead of re-sorting a malformed date column.
+        st.warning(
+            "Could not parse '" + str(time_col) + "' as a date (mixed or "
+            "ambiguous format detected). Using the original row order from "
+            "the file as the time sequence instead of sorting — please "
+            "confirm your file is already sorted chronologically."
+        )
         ts_df = ts_df.set_index(time_col)
 
     series_preview = ts_df[value_col]
@@ -2092,14 +2266,18 @@ def render_time_series_tab(df, df_cleaned, plot_template):
                 if control_col and control_col != "None":
                     ctrl_df = mdf[[time_col, control_col]].dropna().copy()
 
+                    ctrl_date_ok = False
                     try:
-                        ctrl_df[time_col] = pd.to_datetime(ctrl_df[time_col])
+                        ctrl_df[time_col] = pd.to_datetime(ctrl_df[time_col], errors="raise")
+                        ctrl_date_ok = True
                     except Exception:
-                        pass
+                        ctrl_date_ok = False
 
-                    try:
+                    if ctrl_date_ok:
                         ctrl_df = ctrl_df.sort_values(time_col).set_index(time_col)
-                    except Exception:
+                    else:
+                        # Same safeguard as the main series: don't sort
+                        # unparseable date strings alphabetically.
                         ctrl_df = ctrl_df.set_index(time_col)
 
                     control_series = ctrl_df[control_col]

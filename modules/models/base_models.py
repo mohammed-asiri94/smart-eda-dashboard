@@ -1392,6 +1392,481 @@ def run_linear_regression(
         st.text(result.summary().as_text())
 
 
+
+
+# ============================================================
+# GLM link-scale non-linearity checks (Logistic + Poisson)
+# ============================================================
+
+def _glm_bic(result):
+    """Return a likelihood-based BIC when available."""
+    for attr in ("bic_llf", "bic"):
+        try:
+            val = getattr(result, attr)
+            if np.isfinite(val):
+                return float(val)
+        except Exception:
+            pass
+    return np.nan
+
+
+def _glm_numeric_candidates(df, predictors, min_unique=6):
+    """Numeric predictors suitable for non-linearity checks. Binary variables are skipped."""
+    out = []
+    for col in predictors:
+        if col not in df.columns:
+            continue
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").dropna()
+        unique_vals = vals.nunique()
+        if unique_vals < min_unique:
+            continue
+        # Skip binary/indicator-like numeric variables; transformation is not meaningful.
+        uniq = set(vals.dropna().unique().tolist())
+        if unique_vals <= 2 or uniq.issubset({0, 1, 0.0, 1.0}):
+            continue
+        out.append(col)
+    return out
+
+
+def _formula_term_for_col(col, df):
+    """Formula-safe term for numeric or categorical columns."""
+    if col in df.columns and (
+        pd.api.types.is_object_dtype(df[col])
+        or pd.api.types.is_categorical_dtype(df[col])
+        or pd.api.types.is_bool_dtype(df[col])
+    ):
+        return f"C({quote_col(col)})"
+    return quote_col(col)
+
+
+def _build_formula_with_custom_terms(target, predictors, df, custom_terms=None):
+    """Build formula while replacing selected original predictors with custom formula terms."""
+    custom_terms = custom_terms or {}
+    parts = []
+    for col in predictors:
+        if col in custom_terms:
+            terms = custom_terms[col]
+            if isinstance(terms, str):
+                terms = [terms]
+            parts.extend(terms)
+        else:
+            parts.append(_formula_term_for_col(col, df))
+    # remove duplicate terms while preserving order
+    seen = set()
+    uniq = []
+    for term in parts:
+        if term not in seen:
+            uniq.append(term)
+            seen.add(term)
+    return f"{quote_col(target)} ~ {' + '.join(uniq)}"
+
+
+def _candidate_strength(aic_improvement):
+    """Translate AIC improvement into practical recommendation strength."""
+    if not np.isfinite(aic_improvement) or aic_improvement < 2:
+        return "None", "Keep linear", "No meaningful improvement over the original linear term."
+    if aic_improvement < 5:
+        return "Weak", "Optional", "Small AIC improvement. Consider only if clinically/statistically plausible."
+    if aic_improvement < 10:
+        return "Moderate", "Consider", "Moderate AIC improvement. Consider this transformation and compare interpretation."
+    return "Strong", "Recommended", "Large AIC improvement. This suggests meaningful non-linearity on the link scale."
+
+
+def _box_tidwell_for_logistic(model_df, target, predictors, variable):
+    """Box-Tidwell test for linearity of a positive continuous predictor in the logit."""
+    try:
+        vals = pd.to_numeric(model_df[variable], errors="coerce")
+        if (vals <= 0).any():
+            return np.nan, "Skipped: requires all values > 0"
+        bt_df = model_df.copy()
+        bt_col = _safe_internal_name("bt", variable, set(bt_df.columns))
+        bt_df[bt_col] = vals * np.log(vals)
+        formula = _build_formula_with_custom_terms(
+            target,
+            predictors,
+            bt_df,
+            custom_terms={variable: [quote_col(variable), quote_col(bt_col)]},
+        )
+        bt_res = smf.logit(formula=formula, data=bt_df).fit(disp=False)
+        pval = float(bt_res.pvalues.get(quote_col(bt_col), np.nan))
+        return pval, "Possible non-linearity" if np.isfinite(pval) and pval < 0.05 else "No strong evidence"
+    except Exception as e:
+        return np.nan, "Failed: " + str(e)[:80]
+
+
+def _fit_glm_candidate(model_type, formula, cand_df, target, offset=None):
+    """Fit Logistic or Poisson candidate model."""
+    if model_type == "logistic":
+        return smf.logit(formula=formula, data=cand_df).fit(disp=False)
+    if model_type == "poisson":
+        return smf.glm(
+            formula=formula,
+            data=cand_df,
+            family=sm.families.Poisson(),
+            offset=offset,
+        ).fit()
+    raise ValueError("Unsupported model_type")
+
+
+def _candidate_metrics(model_type, res, cand_df, target, offset=None):
+    """Comparable model metrics for candidate transformations."""
+    out = {
+        "AIC": float(res.aic),
+        "BIC": _glm_bic(res),
+        "Log-Likelihood": float(getattr(res, "llf", np.nan)),
+    }
+    if model_type == "logistic":
+        y = cand_df[target].astype(int).values
+        probs = np.asarray(res.predict(cand_df), dtype=float)
+        try:
+            out["AUC"] = float(roc_auc_score(y, probs)) if len(np.unique(y)) == 2 else np.nan
+        except Exception:
+            out["AUC"] = np.nan
+        try:
+            out["Brier"] = float(brier_score_loss(y, probs))
+        except Exception:
+            out["Brier"] = np.nan
+        try:
+            out["Log Loss"] = float(log_loss(y, probs, labels=[0, 1]))
+        except Exception:
+            out["Log Loss"] = np.nan
+    if model_type == "poisson":
+        out["Pearson χ²/df"] = float(res.pearson_chi2 / res.df_resid) if res.df_resid else np.nan
+        out["Deviance/df"] = float(res.deviance / res.df_resid) if res.df_resid else np.nan
+    return out
+
+
+def _build_transformation_candidates(model_df, variable):
+    """Create transformed data and custom formula terms for one numeric variable."""
+    vals = pd.to_numeric(model_df[variable], errors="coerce")
+    candidates = []
+
+    # Original linear term
+    candidates.append({
+        "Form": "Linear",
+        "Display": variable,
+        "df": model_df.copy(),
+        "custom_terms": {},
+        "note": "Original linear term on the link scale.",
+    })
+
+    # Centered squared term: keep x + (x-mean)^2
+    sq_df = model_df.copy()
+    sq_col = _safe_internal_name("sq", variable, set(sq_df.columns))
+    mean_val = float(vals.mean())
+    sq_df[sq_col] = (vals - mean_val) ** 2
+    candidates.append({
+        "Form": "Squared",
+        "Display": f"{variable} + {variable}²",
+        "df": sq_df,
+        "custom_terms": {variable: [quote_col(variable), quote_col(sq_col)]},
+        "note": f"Uses centered squared term: ({variable} - {mean_val:.4f})².",
+    })
+
+    # Log transformation: log(x) if positive, log1p(x) if zero/non-negative.
+    if (vals > 0).all():
+        log_df = model_df.copy()
+        log_col = _safe_internal_name("log", variable, set(log_df.columns))
+        log_df[log_col] = np.log(vals)
+        candidates.append({
+            "Form": "Log",
+            "Display": f"log({variable})",
+            "df": log_df,
+            "custom_terms": {variable: [quote_col(log_col)]},
+            "note": "Uses natural log because all values are > 0.",
+        })
+    elif (vals >= 0).all():
+        log_df = model_df.copy()
+        log_col = _safe_internal_name("log1p", variable, set(log_df.columns))
+        log_df[log_col] = np.log1p(vals)
+        candidates.append({
+            "Form": "Log1p",
+            "Display": f"log1p({variable})",
+            "df": log_df,
+            "custom_terms": {variable: [quote_col(log_col)]},
+            "note": "Uses log1p(x) because the variable contains zero values.",
+        })
+
+    # Square-root transformation
+    if (vals >= 0).all():
+        sqrt_df = model_df.copy()
+        sqrt_col = _safe_internal_name("sqrt", variable, set(sqrt_df.columns))
+        sqrt_df[sqrt_col] = np.sqrt(vals)
+        candidates.append({
+            "Form": "Sqrt",
+            "Display": f"sqrt({variable})",
+            "df": sqrt_df,
+            "custom_terms": {variable: [quote_col(sqrt_col)]},
+            "note": "Uses square-root transformation because all values are ≥ 0.",
+        })
+
+    return candidates
+
+
+
+def _available_manual_transform_options(df, variable):
+    """Available manual predictor transformations based on the data values."""
+    vals = pd.to_numeric(df[variable], errors="coerce").dropna()
+    opts = ["None"]
+    if vals.empty:
+        return opts
+    opts.append("Squared: x + centered x²")
+    if (vals > 0).all():
+        opts.append("Log: log(x)")
+    elif (vals >= 0).all():
+        opts.append("Log1p: log(1+x)")
+    if (vals >= 0).all():
+        opts.append("Sqrt: sqrt(x)")
+    return opts
+
+
+def _apply_manual_predictor_transformations(model_df, predictors, transform_map=None):
+    """
+    Apply user-selected predictor transformations for GLM models.
+
+    These transformations affect the fitted formula. The original predictor names remain
+    in the UI and prediction inputs; internal generated columns are added to model_df.
+    """
+    transform_map = transform_map or {}
+    df_out = model_df.copy()
+    custom_terms = {}
+    specs = []
+    notes = []
+
+    for col in predictors:
+        choice = transform_map.get(col, "None")
+        if not choice or choice == "None" or col not in df_out.columns:
+            continue
+        if not pd.api.types.is_numeric_dtype(df_out[col]):
+            continue
+        vals = pd.to_numeric(df_out[col], errors="coerce")
+        existing = set(df_out.columns)
+
+        if choice == "Squared: x + centered x²":
+            mean_val = float(vals.mean())
+            new_col = _safe_internal_name("manual_sq", col, existing)
+            df_out[new_col] = (vals - mean_val) ** 2
+            custom_terms[col] = [quote_col(col), quote_col(new_col)]
+            specs.append({"source": col, "new_col": new_col, "type": "squared_centered", "mean": mean_val})
+            notes.append(f"{col}: using {col} + centered {col}² [({col} - {mean_val:.4f})²]")
+
+        elif choice == "Log: log(x)":
+            if (vals <= 0).any():
+                raise ValueError(f"log({col}) requires all values to be greater than 0.")
+            new_col = _safe_internal_name("manual_log", col, existing)
+            df_out[new_col] = np.log(vals)
+            custom_terms[col] = [quote_col(new_col)]
+            specs.append({"source": col, "new_col": new_col, "type": "log"})
+            notes.append(f"{col}: using log({col})")
+
+        elif choice == "Log1p: log(1+x)":
+            if (vals < 0).any():
+                raise ValueError(f"log1p({col}) requires all values to be 0 or greater.")
+            new_col = _safe_internal_name("manual_log1p", col, existing)
+            df_out[new_col] = np.log1p(vals)
+            custom_terms[col] = [quote_col(new_col)]
+            specs.append({"source": col, "new_col": new_col, "type": "log1p"})
+            notes.append(f"{col}: using log1p({col}) because zeros may be present")
+
+        elif choice == "Sqrt: sqrt(x)":
+            if (vals < 0).any():
+                raise ValueError(f"sqrt({col}) requires all values to be 0 or greater.")
+            new_col = _safe_internal_name("manual_sqrt", col, existing)
+            df_out[new_col] = np.sqrt(vals)
+            custom_terms[col] = [quote_col(new_col)]
+            specs.append({"source": col, "new_col": new_col, "type": "sqrt"})
+            notes.append(f"{col}: using sqrt({col})")
+
+    return df_out, custom_terms, specs, notes
+
+
+def _add_manual_transform_columns_to_new_data(new_df, transform_specs):
+    """Create the same manual transformation columns in new prediction data."""
+    if not transform_specs:
+        return new_df.copy()
+    out = new_df.copy()
+    for spec in transform_specs:
+        source = spec["source"]
+        new_col = spec["new_col"]
+        if source not in out.columns:
+            raise ValueError(f"New data is missing required predictor column: {source}")
+        vals = pd.to_numeric(out[source], errors="coerce")
+        typ = spec["type"]
+        if typ == "squared_centered":
+            out[new_col] = (vals - float(spec.get("mean", 0.0))) ** 2
+        elif typ == "log":
+            if (vals <= 0).any():
+                raise ValueError(f"log({source}) requires all new-data values to be greater than 0.")
+            out[new_col] = np.log(vals)
+        elif typ == "log1p":
+            if (vals < 0).any():
+                raise ValueError(f"log1p({source}) requires all new-data values to be 0 or greater.")
+            out[new_col] = np.log1p(vals)
+        elif typ == "sqrt":
+            if (vals < 0).any():
+                raise ValueError(f"sqrt({source}) requires all new-data values to be 0 or greater.")
+            out[new_col] = np.sqrt(vals)
+    return out
+
+
+def _link_scale_linearity_check(
+    model_type,
+    model_df,
+    target,
+    predictors,
+    base_result,
+    plot_template,
+    offset_col=None,
+    offset_values=None,
+):
+    """Recommendation-only link-scale linearity check for Logistic and Poisson models."""
+    title = "Advanced: Link-scale Linearity Check"
+    st.markdown(f"### {title}")
+    if model_type == "logistic":
+        st.caption(
+            "Checks whether numeric predictors look linear with the log-odds. "
+            "This is recommendation-only; it does not change your current model."
+        )
+    else:
+        st.caption(
+            "Checks whether numeric predictors look linear with log(expected count/rate). "
+            "This is recommendation-only; it does not change your current model."
+        )
+
+    numeric_vars = _glm_numeric_candidates(model_df, predictors)
+    if not numeric_vars:
+        st.info("No suitable numeric predictors found. Binary and categorical predictors are skipped.")
+        return pd.DataFrame()
+
+    base_aic = float(base_result.aic)
+    base_bic = _glm_bic(base_result)
+    rows = []
+    detail_rows = []
+
+    for var in numeric_vars:
+        candidates = _build_transformation_candidates(model_df, var)
+        cand_results = []
+        for cand in candidates:
+            try:
+                cand_df = cand["df"]
+                # If a Poisson offset is used, align offset to candidate dataframe index.
+                cand_offset = None
+                if model_type == "poisson" and offset_col:
+                    cand_offset = np.log(pd.to_numeric(cand_df[offset_col], errors="coerce").astype(float))
+                formula = _build_formula_with_custom_terms(
+                    target,
+                    predictors,
+                    cand_df,
+                    custom_terms=cand["custom_terms"],
+                )
+                res = _fit_glm_candidate(model_type, formula, cand_df, target, offset=cand_offset)
+                metrics = _candidate_metrics(model_type, res, cand_df, target, offset=cand_offset)
+                cand_results.append({**cand, "formula": formula, "result": res, "metrics": metrics})
+                detail = {
+                    "Variable": var,
+                    "Candidate form": cand["Form"],
+                    "Displayed form": cand["Display"],
+                    "AIC": round(metrics.get("AIC", np.nan), 3),
+                    "ΔAIC vs linear": round(metrics.get("AIC", np.nan) - base_aic, 3),
+                    "BIC": round(metrics.get("BIC", np.nan), 3) if np.isfinite(metrics.get("BIC", np.nan)) else np.nan,
+                    "Note": cand["note"],
+                }
+                if model_type == "logistic":
+                    detail.update({
+                        "AUC": round(metrics.get("AUC", np.nan), 4) if np.isfinite(metrics.get("AUC", np.nan)) else np.nan,
+                        "Brier": round(metrics.get("Brier", np.nan), 4) if np.isfinite(metrics.get("Brier", np.nan)) else np.nan,
+                        "Log Loss": round(metrics.get("Log Loss", np.nan), 4) if np.isfinite(metrics.get("Log Loss", np.nan)) else np.nan,
+                    })
+                else:
+                    detail.update({
+                        "Pearson χ²/df": round(metrics.get("Pearson χ²/df", np.nan), 4) if np.isfinite(metrics.get("Pearson χ²/df", np.nan)) else np.nan,
+                        "Deviance/df": round(metrics.get("Deviance/df", np.nan), 4) if np.isfinite(metrics.get("Deviance/df", np.nan)) else np.nan,
+                    })
+                detail_rows.append(detail)
+            except Exception as e:
+                detail_rows.append({
+                    "Variable": var,
+                    "Candidate form": cand["Form"],
+                    "Displayed form": cand["Display"],
+                    "AIC": np.nan,
+                    "ΔAIC vs linear": np.nan,
+                    "BIC": np.nan,
+                    "Note": "Failed: " + str(e)[:120],
+                })
+
+        good = [c for c in cand_results if np.isfinite(c["metrics"].get("AIC", np.nan))]
+        if not good:
+            rows.append({
+                "Variable": var,
+                "Best form": "Not assessed",
+                "AIC improvement": np.nan,
+                "Evidence": "Failed",
+                "Recommendation": "No recommendation",
+                "Reason": "All candidate models failed.",
+            })
+            continue
+        best = min(good, key=lambda x: x["metrics"].get("AIC", np.inf))
+        improvement = base_aic - best["metrics"].get("AIC", np.nan)
+        evidence, rec, reason = _candidate_strength(improvement)
+
+        bt_p, bt_note = (np.nan, "Not applicable")
+        if model_type == "logistic":
+            bt_p, bt_note = _box_tidwell_for_logistic(model_df, target, predictors, var)
+            if np.isfinite(bt_p) and bt_p < 0.05 and rec == "Keep linear":
+                evidence = "Possible"
+                rec = "Inspect"
+                reason = "Box-Tidwell suggests possible non-linearity, but AIC improvement from tested forms was small."
+
+        rows.append({
+            "Variable": var,
+            "Best form": best["Display"],
+            "Original AIC": round(base_aic, 3),
+            "Best AIC": round(best["metrics"].get("AIC", np.nan), 3),
+            "AIC improvement": round(improvement, 3) if np.isfinite(improvement) else np.nan,
+            "Evidence": evidence,
+            "Recommendation": rec,
+            "Reason": reason,
+            "Box-Tidwell p": round(bt_p, 5) if np.isfinite(bt_p) else np.nan,
+            "Box-Tidwell note": bt_note,
+        })
+
+    rec_df = pd.DataFrame(rows)
+    detail_df = pd.DataFrame(detail_rows)
+
+    st.markdown("#### Recommendation table")
+    st.dataframe(rec_df, use_container_width=True)
+
+    with st.expander("Show all candidate model comparisons", expanded=False):
+        st.dataframe(detail_df, use_container_width=True)
+
+    # Simple visual summary of AIC improvement by variable.
+    try:
+        plot_df = rec_df.copy()
+        plot_df = plot_df[np.isfinite(plot_df["AIC improvement"])]
+        if not plot_df.empty:
+            fig = px.bar(
+                plot_df,
+                x="Variable",
+                y="AIC improvement",
+                color="Recommendation",
+                title="Best transformation AIC improvement vs original model",
+                template=plot_template,
+            )
+            fig.add_hline(y=2, line_dash="dash", annotation_text="AIC improvement = 2")
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        pass
+
+    st.info(
+        "How to use this: keep the original model if AIC improvement is <2. "
+        "If improvement is ≥2, consider the suggested form, then refit and check interpretation, calibration, and diagnostics. "
+        "This section does not automatically change your model."
+    )
+    return rec_df
+
+
 # ============================================================
 # Binary Logistic Regression
 # ============================================================
@@ -1582,7 +2057,7 @@ def _logistic_vif_table(result):
     return pd.DataFrame(rows)
 
 
-def _logistic_predict_on_new_data(model_df, target, predictors, result, threshold):
+def _logistic_predict_on_new_data(model_df, target, predictors, result, threshold, transform_specs=None):
     st.markdown("### Predict on New Data")
     st.caption(
         "Use the fitted full-data logistic model to predict event probability for new observations. "
@@ -1615,7 +2090,9 @@ def _logistic_predict_on_new_data(model_df, target, predictors, result, threshol
                 for pred in predictors:
                     if not pd.api.types.is_numeric_dtype(model_df[pred]):
                         one_df[pred] = one_df[pred].astype(str)
-                prob = float(result.predict(one_df).iloc[0] if hasattr(result.predict(one_df), "iloc") else result.predict(one_df)[0])
+                one_df = _add_manual_transform_columns_to_new_data(one_df, transform_specs or [])
+                pred_out = result.predict(one_df)
+                prob = float(pred_out.iloc[0] if hasattr(pred_out, "iloc") else pred_out[0])
                 pred_class = int(prob >= threshold)
                 st.success(f"Predicted probability of event: {prob:.4f} | Predicted class at threshold {threshold:.2f}: {pred_class}")
             except Exception as e:
@@ -1637,6 +2114,7 @@ def _logistic_predict_on_new_data(model_df, target, predictors, result, threshol
                 st.error("New data is missing required columns: " + ", ".join(missing_cols))
             else:
                 pred_input = new_df.copy()
+                pred_input = _add_manual_transform_columns_to_new_data(pred_input, transform_specs or [])
                 probs_new = np.asarray(result.predict(pred_input), dtype=float)
                 output_df = new_df.copy()
                 output_df[f"predicted_probability_{target}"] = np.round(probs_new, 4)
@@ -1653,7 +2131,7 @@ def _logistic_predict_on_new_data(model_df, target, predictors, result, threshol
             st.error("New-data prediction failed: " + str(e))
 
 
-def _logistic_prediction_workflow(model_df, target, predictors, formula, full_result, test_size, random_state, threshold, plot_template):
+def _logistic_prediction_workflow(model_df, target, predictors, formula, full_result, test_size, random_state, threshold, plot_template, transform_specs=None):
     st.markdown("## Logistic Prediction / Validation Workflow")
     st.info(
         "Prediction mode evaluates probability and classification performance on a held-out test set. "
@@ -1727,7 +2205,7 @@ def _logistic_prediction_workflow(model_df, target, predictors, formula, full_re
         elif np.isfinite(test_auc):
             st.success("Prediction performance is evaluated on held-out test data.")
 
-        _logistic_predict_on_new_data(model_df, target, predictors, full_result, threshold)
+        _logistic_predict_on_new_data(model_df, target, predictors, full_result, threshold, transform_specs=transform_specs)
 
     except Exception as e:
         st.warning("Logistic train/test prediction workflow could not be completed: " + str(e))
@@ -1742,6 +2220,8 @@ def run_logistic_regression(
     test_size=0.20,
     split_random_state=42,
     classification_threshold=0.50,
+    check_link_linearity=False,
+    predictor_transform_map=None,
 ):
     model_df = prepare_data(df, target, predictors)
     if model_df.empty:
@@ -1759,12 +2239,23 @@ def run_logistic_regression(
         model_df[target] = model_df[target].map({sorted_cls[0]: 0, sorted_cls[1]: 1})
         st.info(f"Target encoded: {sorted_cls[0]} → 0, {sorted_cls[1]} → 1")
 
+    manual_transform_specs = []
+    try:
+        model_df, manual_custom_terms, manual_transform_specs, manual_notes = _apply_manual_predictor_transformations(
+            model_df, predictors, predictor_transform_map
+        )
+    except Exception as e:
+        st.error("Manual predictor transformation failed: " + str(e))
+        return
+
     y_true_full = model_df[target].astype(int)
-    formula = build_formula(target, predictors, model_df)
+    formula = _build_formula_with_custom_terms(target, predictors, model_df, custom_terms=manual_custom_terms)
     result = smf.logit(formula=formula, data=model_df).fit(disp=False)
 
     st.success("✅ Logistic model fitted successfully.")
     st.code(formula, language="text")
+    if manual_transform_specs:
+        st.info("Manual predictor transformation(s) applied: " + " | ".join(manual_notes))
 
     # Core model fit metrics
     mcfadden = 1 - (result.llf / result.llnull) if result.llnull != 0 else np.nan
@@ -1786,7 +2277,17 @@ def run_logistic_regression(
             random_state=split_random_state,
             threshold=classification_threshold,
             plot_template=plot_template,
+            transform_specs=manual_transform_specs,
         )
+        if check_link_linearity:
+            _link_scale_linearity_check(
+                model_type="logistic",
+                model_df=model_df,
+                target=target,
+                predictors=predictors,
+                base_result=result,
+                plot_template=plot_template,
+            )
         with st.expander("Optional: Logistic inference summary", expanded=False):
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("N", int(result.nobs))
@@ -1933,7 +2434,17 @@ def run_logistic_regression(
             "fix": "Consider adding more relevant predictors, non-linear terms, or interaction terms.",
         })
 
-    _logistic_predict_on_new_data(model_df, target, predictors, result, classification_threshold)
+    if check_link_linearity:
+        _link_scale_linearity_check(
+            model_type="logistic",
+            model_df=model_df,
+            target=target,
+            predictors=predictors,
+            base_result=result,
+            plot_template=plot_template,
+        )
+
+    _logistic_predict_on_new_data(model_df, target, predictors, result, classification_threshold, transform_specs=manual_transform_specs)
 
     st.markdown("### 🩺 Diagnostic Summary")
     show_diagnostics_header(issues)
@@ -1995,7 +2506,7 @@ def _poisson_extrapolation_warnings(train_df, new_df, predictors):
     return warnings
 
 
-def _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=None):
+def _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=None, transform_specs=None):
     """Manual and file-based prediction for Poisson models."""
     st.markdown("### Predict on New Data")
     st.caption(
@@ -2040,6 +2551,7 @@ def _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_
                 warn = _poisson_extrapolation_warnings(model_df, one_df, predictors)
                 if warn:
                     st.warning("Extrapolation warning: " + " | ".join(warn))
+                one_df = _add_manual_transform_columns_to_new_data(one_df, transform_specs or [])
                 pred_count = float(result.predict(one_df, offset=offset).iloc[0])
                 st.success(f"Predicted {target}: {pred_count:.4f}")
                 if exposure_col:
@@ -2073,6 +2585,7 @@ def _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_
             warn = _poisson_extrapolation_warnings(model_df, pred_input, predictors)
             if warn:
                 st.warning("Extrapolation warning: " + " | ".join(warn))
+            pred_input = _add_manual_transform_columns_to_new_data(pred_input, transform_specs or [])
             pred_counts = result.predict(pred_input, offset=offset)
             output_df = new_df.copy()
             output_df[f"predicted_{target}"] = np.round(pred_counts, 4)
@@ -2181,6 +2694,8 @@ def run_poisson_regression(
     split_random_state=42,
     exposure_col=None,
     compare_negative_binomial=True,
+    check_link_linearity=False,
+    predictor_transform_map=None,
 ):
     cols = [target] + predictors + ([exposure_col] if exposure_col else [])
     model_df = df[cols].dropna().copy()
@@ -2208,11 +2723,20 @@ def run_poisson_regression(
         offset = np.log(model_df[exposure_col].astype(float))
         st.info(f"Using exposure offset: offset(log({exposure_col})). The model estimates event rates adjusted for exposure.")
 
+    manual_transform_specs = []
+    try:
+        model_df, manual_custom_terms, manual_transform_specs, manual_notes = _apply_manual_predictor_transformations(
+            model_df, predictors, predictor_transform_map
+        )
+    except Exception as e:
+        st.error("Manual predictor transformation failed: " + str(e))
+        return
+
     mean_t = model_df[target].mean()
     var_t = model_df[target].var()
     var_mean_ratio = var_t / mean_t if mean_t > 0 else np.nan
 
-    formula = build_formula(target, predictors, model_df)
+    formula = _build_formula_with_custom_terms(target, predictors, model_df, custom_terms=manual_custom_terms)
     result = smf.glm(
         formula=formula,
         data=model_df,
@@ -2222,6 +2746,8 @@ def run_poisson_regression(
 
     st.success("✅ Poisson model fitted successfully.")
     st.code(formula + (f" + offset(log({exposure_col}))" if exposure_col else ""), language="text")
+    if manual_transform_specs:
+        st.info("Manual predictor transformation(s) applied: " + " | ".join(manual_notes))
 
     pearson_disp = float(result.pearson_chi2 / result.df_resid) if result.df_resid else np.nan
     deviance_disp = float(result.deviance / result.df_resid) if result.df_resid else np.nan
@@ -2271,7 +2797,17 @@ def run_poisson_regression(
             plot_template=plot_template,
             exposure_col=exposure_col,
         )
-        _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=exposure_col)
+        _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=exposure_col, transform_specs=manual_transform_specs)
+        if check_link_linearity:
+            _link_scale_linearity_check(
+                model_type="poisson",
+                model_df=model_df,
+                target=target,
+                predictors=predictors,
+                base_result=result,
+                plot_template=plot_template,
+                offset_col=exposure_col,
+            )
         show_full_poisson_diagnostics = st.checkbox(
             "Show full Poisson diagnostics in prediction mode",
             value=False,
@@ -2371,6 +2907,17 @@ def run_poisson_regression(
         fig_dr.add_hline(y=0, line_dash="dash")
         st.plotly_chart(fig_dr, use_container_width=True)
 
+    if check_link_linearity:
+        _link_scale_linearity_check(
+            model_type="poisson",
+            model_df=model_df,
+            target=target,
+            predictors=predictors,
+            base_result=result,
+            plot_template=plot_template,
+            offset_col=exposure_col,
+        )
+
     if compare_negative_binomial:
         st.markdown("### Poisson vs Negative Binomial Comparison")
         try:
@@ -2408,7 +2955,7 @@ def run_poisson_regression(
             st.info("Negative Binomial comparison could not be completed: " + str(e))
 
     if not enable_prediction_split:
-        _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=exposure_col)
+        _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=exposure_col, transform_specs=manual_transform_specs)
 
     st.markdown("### 🩺 Diagnostic Summary")
     show_diagnostics_header(issues)
@@ -2526,7 +3073,7 @@ MODEL_GUIDANCE = {
 def render_base_model_tab(df, df_cleaned, plot_template):
     """Called from app.py inside Tab 5."""
     st.markdown("## Statistical Modeling — Base Models")
-    st.caption("Base Models version: v8_poisson_offset_prediction_nb")
+    st.caption("Base Models version: v10_glm_manual_predictor_transformations")
     st.info(
         "Rows with missing values in the selected variables are removed before fitting. "
         "All diagnostics and fix suggestions appear on this page."
@@ -2579,12 +3126,16 @@ def render_base_model_tab(df, df_cleaned, plot_template):
     log_test_size = 0.20
     log_random_state = 42
     log_threshold = 0.50
+    log_check_link_linearity = False
+    log_predictor_transform_map = {}
 
     pois_enable_split = False
     pois_test_size = 0.20
     pois_random_state = 42
     pois_exposure_col = None
     pois_compare_nb = True
+    pois_check_link_linearity = False
+    pois_predictor_transform_map = {}
 
     if model_type == "Linear Regression":
         with st.expander("Linear Regression options", expanded=True):
@@ -2731,6 +3282,41 @@ def render_base_model_tab(df, df_cleaned, plot_template):
                 key="log_threshold",
                 help="Probability cutoff for classifying event=1. Lower values usually increase sensitivity; higher values usually increase specificity.",
             )
+
+            st.markdown("#### Advanced: Link-scale linearity")
+            log_check_link_linearity = st.checkbox(
+                "Check non-linearity for numeric predictors (recommendations only)",
+                value=False,
+                key="log_check_link_linearity",
+                help=(
+                    "Automatically checks numeric predictors using squared, log/log1p, and sqrt candidates. "
+                    "The app only gives recommendations and does not change the fitted model."
+                ),
+            )
+
+            log_apply_manual_transform = st.checkbox(
+                "Apply predictor transformation manually",
+                value=False,
+                key="log_apply_manual_transform",
+                help=(
+                    "Use this after the recommendation table suggests a transformation. "
+                    "This changes the fitted logistic formula and keeps new-data prediction compatible."
+                ),
+            )
+            if log_apply_manual_transform:
+                st.caption("Choose transformations for numeric predictors only. Categorical and binary variables are skipped.")
+                log_numeric_transform_candidates = _glm_numeric_candidates(mdf, predictors)
+                if not log_numeric_transform_candidates:
+                    st.info("No suitable numeric predictors available for manual transformation.")
+                for var in log_numeric_transform_candidates:
+                    opts = _available_manual_transform_options(mdf, var)
+                    log_predictor_transform_map[var] = st.selectbox(
+                        f"Transform {var}",
+                        opts,
+                        index=0,
+                        key=f"log_manual_transform_{var}",
+                    )
+
             if log_enable_split:
                 lp1, lp2 = st.columns(2)
                 log_test_size = lp1.slider(
@@ -2811,6 +3397,40 @@ def render_base_model_tab(df, df_cleaned, plot_template):
                 help="Useful when overdispersion is present. Compares AIC/BIC and dispersion with a Negative Binomial model.",
             )
 
+            st.markdown("#### Advanced: Link-scale linearity")
+            pois_check_link_linearity = st.checkbox(
+                "Check non-linearity for numeric predictors (recommendations only)",
+                value=False,
+                key="pois_check_link_linearity",
+                help=(
+                    "Automatically checks numeric predictors using squared, log/log1p, and sqrt candidates. "
+                    "The app only gives recommendations and does not change the fitted model."
+                ),
+            )
+
+            pois_apply_manual_transform = st.checkbox(
+                "Apply predictor transformation manually",
+                value=False,
+                key="pois_apply_manual_transform",
+                help=(
+                    "Use this after the recommendation table suggests a transformation. "
+                    "This changes the fitted Poisson formula and keeps new-data prediction compatible."
+                ),
+            )
+            if pois_apply_manual_transform:
+                st.caption("Choose transformations for numeric predictors only. Categorical and binary variables are skipped.")
+                pois_numeric_transform_candidates = _glm_numeric_candidates(mdf, predictors)
+                if not pois_numeric_transform_candidates:
+                    st.info("No suitable numeric predictors available for manual transformation.")
+                for var in pois_numeric_transform_candidates:
+                    opts = _available_manual_transform_options(mdf, var)
+                    pois_predictor_transform_map[var] = st.selectbox(
+                        f"Transform {var}",
+                        opts,
+                        index=0,
+                        key=f"pois_manual_transform_{var}",
+                    )
+
     if st.button("▶ Run Model", use_container_width=True, key="bm_run"):
         st.session_state["bm_run_requested"] = True
 
@@ -2849,6 +3469,8 @@ def render_base_model_tab(df, df_cleaned, plot_template):
                     test_size=log_test_size,
                     split_random_state=log_random_state,
                     classification_threshold=log_threshold,
+                    check_link_linearity=log_check_link_linearity,
+                    predictor_transform_map=log_predictor_transform_map,
                 )
             elif model_type == "Poisson Regression":
                 run_poisson_regression(
@@ -2861,6 +3483,8 @@ def render_base_model_tab(df, df_cleaned, plot_template):
                     split_random_state=pois_random_state,
                     exposure_col=pois_exposure_col,
                     compare_negative_binomial=pois_compare_nb,
+                    check_link_linearity=pois_check_link_linearity,
+                    predictor_transform_map=pois_predictor_transform_map,
                 )
             elif model_type == "Negative Binomial Regression":
                 run_negative_binomial(mdf, target, predictors, plot_template)

@@ -181,7 +181,7 @@ def init_session_state():
         "df_cleaned": None,
         "cleaning_applied": False,
         "last_file_id": None,
-        "selected_model": "Base Models  (Linear / Logistic / Poisson / Negative Binomial)",
+        "selected_model_radio_v2": "📊 Base Models  (Linear / Logistic / Poisson / Negative Binomial)",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1644,10 +1644,15 @@ if uploaded_file is not None:
                 "⚖️ Causal Inference  (PSM + IPW)",
             ]
 
+            # Robust default selection: use a new clean key so old session_state
+            # values from previous app versions cannot prevent the first model from opening.
+            if st.session_state.get("selected_model_radio_v2") not in MODEL_OPTIONS:
+                st.session_state["selected_model_radio_v2"] = MODEL_OPTIONS[0]
+
             selected_model = st.radio(
                 "Select model",
                 MODEL_OPTIONS,
-                key="selected_model",
+                key="selected_model_radio_v2",
             )
 
             st.markdown("---")

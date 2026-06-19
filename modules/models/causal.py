@@ -1006,11 +1006,20 @@ def step3_outcome(matched_data, treatment_col, outcome_col,
     with st.expander("Full Model Summary"):
         st.text(result.summary().as_text())
 
+    # Exponentiated values for the ATT vs ATE comparison
+    is_log_link = outcome_type in ("Binary", "Count", "Count (overdispersed)")
+    exp_att    = round(float(np.exp(treat_param)), 4) if is_log_link else None
+    exp_att_lo = round(float(np.exp(treat_ci_lo)), 4) if is_log_link else None
+    exp_att_hi = round(float(np.exp(treat_ci_hi)), 4) if is_log_link else None
+
     return {
-        "att_value": float(treat_param),
-        "att_pval": float(treat_pval),
-        "att_ci_lo": treat_ci_lo,
-        "att_ci_hi": treat_ci_hi,
+        "att_value":  float(treat_param),
+        "att_pval":   float(treat_pval),
+        "att_ci_lo":  treat_ci_lo,
+        "att_ci_hi":  treat_ci_hi,
+        "att_exp":    exp_att,
+        "att_exp_lo": exp_att_lo,
+        "att_exp_hi": exp_att_hi,
         "model_name": model_name,
     }
 
@@ -1023,7 +1032,15 @@ def step3_outcome(matched_data, treatment_col, outcome_col,
 def estimate_ate(data_full, ps, treatment_col, outcome_col, outcome_type):
     """
     Estimate ATE using IPW on the full (unmatched) sample.
-    ATE weight: treated = 1/ps, control = 1/(1-ps)
+
+    ATE weights: treated = 1/ps, control = 1/(1-ps).
+    Weights are continuous floats — passed via var_weights (not freq_weights)
+    to avoid the integer-truncation bug. Robust HC1 sandwich SEs are used
+    throughout so inference is valid despite weight heterogeneity.
+
+    For Binary outcomes we use a weighted logistic GLM so that the ATE
+    coefficient is on the same log-odds scale as the ATT from the matched
+    logistic model. This makes the ATT vs ATE comparison meaningful.
     """
     T = data_full[treatment_col].astype(int).values
     eps = 1e-6
@@ -1033,68 +1050,140 @@ def estimate_ate(data_full, ps, treatment_col, outcome_col, outcome_type):
     w_cap = np.percentile(weights_ate, 99)
     weights_ate_trimmed = np.clip(weights_ate, 0, w_cap)
 
-    data = data_full.copy()
+    data = data_full[[treatment_col, outcome_col]].copy()
+    formula = _quote(outcome_col) + " ~ " + _quote(treatment_col)
 
     try:
-        if outcome_type == "Continuous":
-            result = sm.WLS(
-                data[outcome_col], sm.add_constant(data[treatment_col]),
-                weights=weights_ate_trimmed,
-            ).fit()
-        else:
-            result = sm.WLS(
-                data[outcome_col].astype(float),
-                sm.add_constant(data[treatment_col].astype(float)),
-                weights=weights_ate_trimmed,
-            ).fit()
+        if outcome_type == "Binary":
+            # Ensure 0/1 coding
+            unique_vals = data[outcome_col].dropna().unique()
+            if not set(unique_vals).issubset({0, 1}):
+                sorted_cls = sorted(unique_vals)
+                data[outcome_col] = data[outcome_col].map(
+                    {sorted_cls[0]: 0, sorted_cls[1]: 1}
+                )
+            # Weighted logistic regression with robust SEs (HC1 sandwich)
+            # var_weights accepts continuous floats — no truncation.
+            result = smf.glm(
+                formula=formula, data=data,
+                family=sm.families.Binomial(),
+                var_weights=weights_ate_trimmed,
+            ).fit(cov_type="HC1")
+            scale = "log-odds"
 
-        ate = float(result.params.iloc[1])
-        ate_pval = float(result.pvalues.iloc[1])
-        ate_ci = result.conf_int().iloc[1]
-        ate_ci_lo, ate_ci_hi = float(ate_ci[0]), float(ate_ci[1])
+        elif outcome_type == "Continuous":
+            result = smf.wls(
+                formula=formula, data=data,
+                weights=weights_ate_trimmed,
+            ).fit(cov_type="HC1")
+            scale = "mean difference"
+
+        elif outcome_type in ("Count", "Count (overdispersed)"):
+            result = smf.glm(
+                formula=formula, data=data,
+                family=sm.families.Poisson(),
+                var_weights=weights_ate_trimmed,
+            ).fit(cov_type="HC1")
+            scale = "log-IRR"
+
+        else:
+            result = smf.wls(
+                formula=formula, data=data,
+                weights=weights_ate_trimmed,
+            ).fit(cov_type="HC1")
+            scale = "mean difference"
+
+        # Extract treatment coefficient
+        try:
+            ate      = float(result.params[_quote(treatment_col)])
+            ate_pval = float(result.pvalues[_quote(treatment_col)])
+            ci       = result.conf_int().loc[_quote(treatment_col)]
+        except KeyError:
+            ate      = float(list(result.params)[1])
+            ate_pval = float(list(result.pvalues)[1])
+            ci       = result.conf_int().iloc[1]
+
+        ate_ci_lo, ate_ci_hi = float(ci.iloc[0]), float(ci.iloc[1])
+
+        # Exponentiated values for non-linear models
+        exp_ate    = round(float(np.exp(ate)), 4)    if scale != "mean difference" else None
+        exp_ci_lo  = round(float(np.exp(ate_ci_lo)), 4) if scale != "mean difference" else None
+        exp_ci_hi  = round(float(np.exp(ate_ci_hi)), 4) if scale != "mean difference" else None
+        label      = "OR" if outcome_type == "Binary" else ("IRR" if "Count" in outcome_type else None)
 
         return {
-            "ATE": round(ate, 4),
-            "p-value": round(ate_pval, 5),
-            "CI Lower": round(ate_ci_lo, 4),
-            "CI Upper": round(ate_ci_hi, 4),
+            "ATE":        round(ate, 4),
+            "p-value":    round(ate_pval, 5),
+            "CI Lower":   round(ate_ci_lo, 4),
+            "CI Upper":   round(ate_ci_hi, 4),
+            "scale":      scale,
+            "exp_ate":    exp_ate,
+            "exp_ci_lo":  exp_ci_lo,
+            "exp_ci_hi":  exp_ci_hi,
+            "label":      label,
         }
     except Exception as e:
-        return None
+        return {"error": str(e)}
 
 
 def render_att_vs_ate(att_value, att_pval, att_ci_lo, att_ci_hi,
-                       data_full, ps, treatment_col, outcome_col, outcome_type):
+                       data_full, ps, treatment_col, outcome_col, outcome_type,
+                       att_exp=None, att_exp_lo=None, att_exp_hi=None):
     st.markdown("### ATT vs ATE")
     st.caption(
-        "ATT = effect on those who actually received treatment. "
-        "ATE = expected effect if treatment were applied to the entire population."
+        "ATT = effect on those who actually received treatment (from matched sample). "
+        "ATE = expected effect if treatment were applied to the entire population "
+        "(estimated via IPW on the full sample). "
+        "Both are now on the same scale (log-odds for Binary, log-IRR for Count, "
+        "mean difference for Continuous), so the comparison is valid."
     )
 
     ate_result = estimate_ate(data_full, ps, treatment_col, outcome_col, outcome_type)
 
-    if ate_result is None:
-        st.info("ATE could not be estimated for this outcome type.")
+    if ate_result is None or "error" in ate_result:
+        err = ate_result.get("error", "unknown error") if ate_result else "unknown error"
+        st.info("ATE could not be estimated: " + err)
         return
 
+    scale = ate_result.get("scale", "coefficient")
+    label = ate_result.get("label")  # "OR", "IRR", or None
+
+    # ── Main comparison table (raw coefficients — same scale) ──
     compare_df = pd.DataFrame({
-        "Estimand": ["ATT (matched sample)", "ATE (full sample, IPW)"],
-        "Estimate": [round(att_value, 4), ate_result["ATE"]],
-        "p-value":  [round(att_pval, 5), ate_result["p-value"]],
-        "CI Lower": [round(att_ci_lo, 4), ate_result["CI Lower"]],
-        "CI Upper": [round(att_ci_hi, 4), ate_result["CI Upper"]],
+        "Estimand":  ["ATT (matched sample)", "ATE (full sample, IPW)"],
+        "Estimate (" + scale + ")": [round(att_value, 4), ate_result["ATE"]],
+        "p-value":   [round(att_pval, 5),   ate_result["p-value"]],
+        "CI Lower":  [round(att_ci_lo, 4),  ate_result["CI Lower"]],
+        "CI Upper":  [round(att_ci_hi, 4),  ate_result["CI Upper"]],
     })
+
+    # Add exponentiated columns for non-linear models
+    if label and att_exp is not None:
+        compare_df[label + " (ATT)"]       = [round(att_exp, 4),        ate_result["exp_ate"]]
+        compare_df[label + " CI Lower"]    = [round(att_exp_lo, 4),     ate_result["exp_ci_lo"]]
+        compare_df[label + " CI Upper"]    = [round(att_exp_hi, 4),     ate_result["exp_ci_hi"]]
+
     st.dataframe(compare_df, use_container_width=True)
 
-    if abs(att_value - ate_result["ATE"]) > 0.2 * max(abs(att_value), 1e-6):
-        direction = "larger" if abs(att_value) > abs(ate_result["ATE"]) else "smaller"
+    # ── Interpretation (compare on same log scale) ─────────────
+    att_abs = abs(att_value)
+    ate_abs = abs(ate_result["ATE"])
+    diff_pct = abs(att_abs - ate_abs) / max(att_abs, 1e-9) * 100
+
+    if diff_pct > 20:
+        direction = "larger" if att_abs > ate_abs else "smaller"
         st.info(
-            "ATT is notably " + direction + " than ATE. "
-            "This suggests treatment effects differ between those who self-selected "
-            "into treatment and the broader population."
+            "⚠️ ATT is notably **" + direction + "** than ATE ("
+            + str(round(diff_pct, 1)) + "% difference). "
+            "This suggests the treatment effect is **heterogeneous**: those who "
+            "actually received the treatment may benefit differently from the "
+            "broader population. Consider subgroup analysis to explore this further."
         )
     else:
-        st.success("ATT and ATE are similar, suggesting a fairly consistent treatment effect across the population.")
+        st.success(
+            "✅ ATT and ATE are similar (" + str(round(diff_pct, 1)) + "% difference), "
+            "suggesting a **consistent** treatment effect across the population."
+        )
 
 
 # ============================================================
@@ -1405,54 +1494,66 @@ def run_ipw(data, treatment_col, outcome_col,
             covariate_cols, ps, outcome_type, plot_template):
     st.markdown("## Alternative: Inverse Probability Weighting (IPW)")
     st.caption(
-        "IPW uses all observations (no units discarded). "
+        "IPW uses **all** observations (no units discarded). "
         "Each observation is weighted by the inverse of its propensity score. "
-        "ATT weights: treated=1, control=ps/(1-ps)."
+        "ATT weights: treated = 1, control = ps / (1 − ps). "
+        "Weights are kept as continuous floats (no truncation to integers). "
+        "Robust HC1 sandwich standard errors are used throughout."
     )
 
     issues = []
     T = data[treatment_col].astype(int).values
 
-    # ── Compute ATT weights ───────────────────────────────────
+    # ── Compute ATT weights (continuous, no int truncation) ───
     eps = 1e-6
     ps_clipped = np.clip(ps, eps, 1 - eps)
-
     weights = np.where(T == 1, 1.0, ps_clipped / (1 - ps_clipped))
 
-    # Trim extreme weights (top 1%)
+    # Trim top 1% to reduce influence of extreme weights
     w_cap = np.percentile(weights, 99)
     weights_trimmed = np.clip(weights, 0, w_cap)
 
     ess = (weights_trimmed.sum() ** 2) / (weights_trimmed ** 2).sum()
 
     w1, w2, w3 = st.columns(3)
-    w1.metric("Max weight (trimmed)", round(float(w_cap), 3))
-    w2.metric("Effective Sample Size", round(float(ess), 1))
-    w3.metric("Original N", len(data))
+    w1.metric("Max weight (trimmed at 99th pct)", round(float(w_cap), 3))
+    w2.metric("Effective Sample Size (ESS)",       round(float(ess), 1))
+    w3.metric("Original N",                        len(data))
 
     if ess < len(data) * 0.3:
         issues.append({
             "level": "warning",
-            "msg": "Low effective sample size (ESS=" + str(round(float(ess),1)) + "). Weights are very unequal.",
-            "fix": "Trim more extreme weights or use matching instead.",
+            "msg": "Low ESS (" + str(round(float(ess), 1)) + "). Weights are very unequal.",
+            "fix": "Trim more aggressively or use matching instead of IPW.",
         })
 
-    # ── Weight distribution ───────────────────────────────────
+    # ── Weight distribution plot ──────────────────────────────
     w_df = pd.DataFrame({
         "Weight": weights_trimmed,
-        "Group": ["Treated" if t == 1 else "Control" for t in T],
+        "Group":  ["Treated" if t == 1 else "Control" for t in T],
     })
     fig_w = px.histogram(
         w_df, x="Weight", color="Group",
         barmode="overlay", opacity=0.6, nbins=30,
         color_discrete_map={"Treated": "#2563EB", "Control": "#DC2626"},
-        title="IPW Weight Distribution",
+        title="IPW Weight Distribution (ATT weights)",
         template=plot_template,
+    )
+    fig_w.add_annotation(
+        text="Treated units always have weight = 1",
+        xref="paper", yref="paper", x=0.99, y=0.95,
+        showarrow=False, font=dict(size=11),
     )
     st.plotly_chart(fig_w, use_container_width=True)
 
     # ── Weighted outcome model ────────────────────────────────
-    st.markdown("### Weighted Outcome Model")
+    st.markdown("### Weighted Outcome Model (IPW)")
+    st.caption(
+        "var_weights are used so continuous IPW weights are applied exactly "
+        "without truncation to integers. HC1 robust SEs account for "
+        "weight heterogeneity."
+    )
+
     cat_cols = data[covariate_cols].select_dtypes(
         include=["object", "category", "bool"]
     ).columns.tolist()
@@ -1463,48 +1564,122 @@ def run_ipw(data, treatment_col, outcome_col,
         else:
             parts.append(_quote(col))
     formula = _quote(outcome_col) + " ~ " + " + ".join(parts)
+    st.code(formula, language="text")
+
+    data_fit = data.copy()
 
     try:
         if outcome_type == "Continuous":
             result = smf.wls(
-                formula=formula, data=data, weights=weights_trimmed
-            ).fit()
+                formula=formula, data=data_fit,
+                weights=weights_trimmed,
+            ).fit(cov_type="HC1")
+            is_logit = False
+
         elif outcome_type == "Binary":
-            unique_vals = data[outcome_col].dropna().unique()
+            unique_vals = data_fit[outcome_col].dropna().unique()
             if not set(unique_vals).issubset({0, 1}):
                 sorted_cls = sorted(unique_vals)
-                data[outcome_col] = data[outcome_col].map(
+                data_fit[outcome_col] = data_fit[outcome_col].map(
                     {sorted_cls[0]: 0, sorted_cls[1]: 1}
                 )
+            # var_weights: continuous float weights — no astype(int) needed.
             result = smf.glm(
-                formula=formula, data=data,
+                formula=formula, data=data_fit,
                 family=sm.families.Binomial(),
-                freq_weights=weights_trimmed.astype(int),
-            ).fit()
+                var_weights=weights_trimmed,
+            ).fit(cov_type="HC1")
+            is_logit = True
+
+        elif outcome_type in ("Count", "Count (overdispersed)"):
+            result = smf.glm(
+                formula=formula, data=data_fit,
+                family=sm.families.Poisson(),
+                var_weights=weights_trimmed,
+            ).fit(cov_type="HC1")
+            is_logit = True  # log link — exponentiate to get IRR
+
         else:
             result = smf.wls(
-                formula=formula, data=data, weights=weights_trimmed
-            ).fit()
+                formula=formula, data=data_fit,
+                weights=weights_trimmed,
+            ).fit(cov_type="HC1")
+            is_logit = False
 
-        # ATT
+        # ── Extract treatment effect ──────────────────────────
         try:
             treat_param = float(result.params[_quote(treatment_col)])
             treat_pval  = float(result.pvalues[_quote(treatment_col)])
+            treat_ci    = result.conf_int().loc[_quote(treatment_col)]
         except KeyError:
             treat_param = float(list(result.params)[1])
             treat_pval  = float(list(result.pvalues)[1])
+            treat_ci    = result.conf_int().iloc[1]
 
-        i1, i2 = st.columns(2)
-        i1.metric("IPW ATT Estimate", round(treat_param, 4))
-        i2.metric("p-value",          round(treat_pval, 5))
+        ci_lo = float(treat_ci.iloc[0])
+        ci_hi = float(treat_ci.iloc[1])
+
+        # ── Display ───────────────────────────────────────────
+        if is_logit:
+            exp_val   = np.exp(treat_param)
+            exp_lo    = np.exp(ci_lo)
+            exp_hi    = np.exp(ci_hi)
+            exp_label = "OR" if outcome_type == "Binary" else "IRR"
+
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Coefficient (log scale)", round(treat_param, 4))
+            r2.metric(exp_label,                 round(exp_val, 4))
+            r3.metric("p-value",                 round(treat_pval, 5))
+            r4.metric("95% CI (" + exp_label + ")",
+                      str(round(exp_lo, 3)) + " – " + str(round(exp_hi, 3)))
+
+            st.markdown(
+                "**" + exp_label + " = " + str(round(exp_val, 4)) +
+                " (95% CI: " + str(round(exp_lo, 4)) +
+                " – " + str(round(exp_hi, 4)) + ")**"
+            )
+        else:
+            r1, r2, r3 = st.columns(3)
+            r1.metric("IPW ATT Estimate", round(treat_param, 4))
+            r2.metric("p-value",          round(treat_pval, 5))
+            r3.metric("95% CI",
+                      str(round(ci_lo, 3)) + " – " + str(round(ci_hi, 3)))
 
         if treat_pval < 0.05:
-            st.success("IPW: Treatment effect significant (p=" + str(round(treat_pval,4)) + ").")
+            st.success(
+                "✅ IPW: Treatment effect is statistically significant "
+                "(p = " + str(round(treat_pval, 4)) + ")."
+            )
         else:
-            st.info("IPW: Treatment effect not significant (p=" + str(round(treat_pval,4)) + ").")
+            st.info(
+                "ℹ️ IPW: Treatment effect is not statistically significant "
+                "(p = " + str(round(treat_pval, 4)) + ")."
+            )
 
-        with st.expander("Full IPW Model Summary"):
-            st.text(result.summary().as_text())
+        # ── Full model table ──────────────────────────────────
+        with st.expander("Full IPW Model Coefficients"):
+            params   = result.params
+            bse      = result.bse
+            pvals    = result.pvalues
+            ci_df    = result.conf_int()
+
+            coef_tbl = pd.DataFrame({
+                "Term":        list(params.index),
+                "Coefficient": [round(float(x), 4) for x in params],
+                "Std Error":   [round(float(x), 4) for x in bse],
+                "p-value":     [round(float(x), 5) for x in pvals],
+                "CI Lower":    [round(float(x), 4) for x in ci_df.iloc[:, 0]],
+                "CI Upper":    [round(float(x), 4) for x in ci_df.iloc[:, 1]],
+                "Significant": ["YES" if float(p) < 0.05 else "NO" for p in pvals],
+            })
+
+            if is_logit:
+                exp_label2 = "OR" if outcome_type == "Binary" else "IRR"
+                coef_tbl[exp_label2]           = [round(float(np.exp(x)), 4) for x in params]
+                coef_tbl[exp_label2 + " CI Lo"] = [round(float(np.exp(x)), 4) for x in ci_df.iloc[:, 0]]
+                coef_tbl[exp_label2 + " CI Hi"] = [round(float(np.exp(x)), 4) for x in ci_df.iloc[:, 1]]
+
+            st.dataframe(coef_tbl, use_container_width=True)
 
     except Exception as e:
         st.warning("IPW outcome model could not be fitted: " + str(e))
@@ -2017,6 +2192,9 @@ def render_causal_tab(df, df_cleaned, plot_template):
                         outcome_results["att_value"], outcome_results["att_pval"],
                         outcome_results["att_ci_lo"], outcome_results["att_ci_hi"],
                         data_clean, ps, treatment_col, outcome_col, outcome_type,
+                        att_exp    = outcome_results.get("att_exp"),
+                        att_exp_lo = outcome_results.get("att_exp_lo"),
+                        att_exp_hi = outcome_results.get("att_exp_hi"),
                     )
                     ate_result = estimate_ate(
                         data_clean, ps, treatment_col, outcome_col, outcome_type,

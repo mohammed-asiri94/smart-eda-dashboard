@@ -28,6 +28,12 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     r2_score,
+    mean_poisson_deviance,
+    brier_score_loss,
+    log_loss,
+    precision_score,
+    recall_score,
+    f1_score,
 )
 from scipy import stats
 from sklearn.model_selection import train_test_split
@@ -390,6 +396,106 @@ def _add_polynomial_columns_to_new_data(new_df, poly_specs):
     return df_new
 
 
+
+
+def _linear_term_expr(col, df):
+    """Formula-safe term expression; categorical predictors are treated like as.factor() in R."""
+    if col in df.columns and (pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_categorical_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col])):
+        return f"C({quote_col(col)})"
+    return quote_col(col)
+
+
+def build_linear_formula_with_interactions(target, predictors, df, interaction_pairs=None):
+    """Build OLS formula with optional interaction terms such as age:sex."""
+    interaction_pairs = interaction_pairs or []
+    parts = [_linear_term_expr(c, df) for c in predictors]
+    for a, b in interaction_pairs:
+        if a in df.columns and b in df.columns and a != b:
+            parts.append(f"{_linear_term_expr(a, df)}:{_linear_term_expr(b, df)}")
+    # remove duplicates while preserving order
+    seen = set()
+    unique_parts = []
+    for part in parts:
+        if part not in seen:
+            unique_parts.append(part)
+            seen.add(part)
+    return f"{quote_col(target)} ~ {' + '.join(unique_parts)}"
+
+
+def _get_training_numeric_ranges(model_df, original_predictors):
+    """Store training ranges used to warn against extrapolation on new data."""
+    ranges = {}
+    for col in original_predictors:
+        if col in model_df.columns and pd.api.types.is_numeric_dtype(model_df[col]):
+            vals = pd.to_numeric(model_df[col], errors="coerce")
+            ranges[col] = {
+                "min": float(vals.min()),
+                "max": float(vals.max()),
+            }
+    return ranges
+
+
+def _extrapolation_warnings(new_df, training_ranges):
+    """Return row-level warnings when numeric new-data values are outside training ranges."""
+    rows = []
+    for col, rng in training_ranges.items():
+        if col not in new_df.columns:
+            continue
+        vals = pd.to_numeric(new_df[col], errors="coerce")
+        mask = (vals < rng["min"]) | (vals > rng["max"])
+        for idx in vals[mask].index:
+            rows.append({
+                "Row": idx,
+                "Variable": col,
+                "New value": vals.loc[idx],
+                "Training min": rng["min"],
+                "Training max": rng["max"],
+                "Warning": "Outside training range; prediction may be extrapolation and less reliable.",
+            })
+    return pd.DataFrame(rows)
+
+
+def _prediction_summary_on_original_scale(result, new_df, outcome_transform="None", alpha=0.05):
+    """Return mean prediction, confidence interval, and prediction interval on original outcome scale."""
+    pred_res = result.get_prediction(new_df)
+    sf = pred_res.summary_frame(alpha=alpha)
+    out = pd.DataFrame({
+        "Predicted": _inverse_outcome_transform(sf["mean"].values, outcome_transform),
+        "Mean CI Lower": _inverse_outcome_transform(sf["mean_ci_lower"].values, outcome_transform),
+        "Mean CI Upper": _inverse_outcome_transform(sf["mean_ci_upper"].values, outcome_transform),
+        "Prediction PI Lower": _inverse_outcome_transform(sf["obs_ci_lower"].values, outcome_transform),
+        "Prediction PI Upper": _inverse_outcome_transform(sf["obs_ci_upper"].values, outcome_transform),
+    })
+    return out
+
+
+def _nested_model_comparison_section(full_result, model_df, model_target, reduced_predictors, interaction_pairs=None):
+    """Compare a reduced OLS model with the current full model using an F-test and AIC/BIC."""
+    if not reduced_predictors:
+        return
+    try:
+        reduced_formula = build_linear_formula_with_interactions(
+            model_target, reduced_predictors, model_df, interaction_pairs=[]
+        )
+        reduced_result = smf.ols(formula=reduced_formula, data=model_df).fit()
+        st.markdown("### Nested Model Comparison / F-test")
+        st.caption(
+            "Compares a smaller reduced model with the current full model. A small p-value suggests the added terms improve model fit."
+        )
+        comp = sm.stats.anova_lm(reduced_result, full_result)
+        st.dataframe(comp.reset_index(drop=True), use_container_width=True)
+        metrics = pd.DataFrame({
+            "Model": ["Reduced model", "Full model"],
+            "Formula": [reduced_formula, str(full_result.model.formula)],
+            "R2": [round(reduced_result.rsquared, 4), round(full_result.rsquared, 4)],
+            "Adjusted R2": [round(reduced_result.rsquared_adj, 4), round(full_result.rsquared_adj, 4)],
+            "AIC": [round(reduced_result.aic, 2), round(full_result.aic, 2)],
+            "BIC": [round(reduced_result.bic, 2), round(full_result.bic, 2)],
+        })
+        st.dataframe(metrics, use_container_width=True)
+    except Exception as e:
+        st.warning("Nested model comparison could not be completed: " + str(e))
+
 def _prediction_split_section(
     model_df,
     original_target,
@@ -405,6 +511,7 @@ def _prediction_split_section(
 ):
     """Train/test validation and new-data prediction for prediction-oriented linear regression."""
     poly_specs = poly_specs or []
+    training_ranges = _get_training_numeric_ranges(model_df, original_predictors)
     st.markdown("## Prediction / Validation Workflow")
     st.info(
         "Prediction mode trains the model on a training set and evaluates it on a held-out test set. "
@@ -425,11 +532,14 @@ def _prediction_split_section(
 
         train_pred_model_scale = train_result.predict(train_df)
         test_pred_model_scale = train_result.predict(test_df)
+        test_interval_tbl = _prediction_summary_on_original_scale(
+            train_result, test_df, outcome_transform=outcome_transform, alpha=0.05
+        )
 
         y_train_actual = train_df[original_target].astype(float).values
         y_test_actual = test_df[original_target].astype(float).values
         train_pred = _inverse_outcome_transform(train_pred_model_scale, outcome_transform)
-        test_pred = _inverse_outcome_transform(test_pred_model_scale, outcome_transform)
+        test_pred = test_interval_tbl["Predicted"].values
 
         train_r2 = float(r2_score(y_train_actual, train_pred))
         test_r2 = float(r2_score(y_test_actual, test_pred))
@@ -444,6 +554,10 @@ def _prediction_split_section(
         c4.metric("Test R2", round(test_r2, 4))
         c5.metric("Test RMSE", round(rmse, 4))
         st.metric("Test MAE", round(mae, 4))
+        st.caption(
+            "Mean CI estimates uncertainty around the average prediction. "
+            "Prediction PI estimates uncertainty for an individual new observation and is usually wider."
+        )
 
         if test_r2 < 0:
             st.warning(
@@ -486,6 +600,10 @@ def _prediction_split_section(
         pred_tbl = test_df[original_predictors].copy()
         pred_tbl["Actual"] = np.round(y_test_actual, 4)
         pred_tbl["Predicted"] = np.round(test_pred, 4)
+        pred_tbl["Mean CI Lower"] = np.round(test_interval_tbl["Mean CI Lower"].values, 4)
+        pred_tbl["Mean CI Upper"] = np.round(test_interval_tbl["Mean CI Upper"].values, 4)
+        pred_tbl["Prediction PI Lower"] = np.round(test_interval_tbl["Prediction PI Lower"].values, 4)
+        pred_tbl["Prediction PI Upper"] = np.round(test_interval_tbl["Prediction PI Upper"].values, 4)
         pred_tbl["Error"] = np.round(y_test_actual - test_pred, 4)
         pred_tbl["Absolute Error"] = np.round(np.abs(y_test_actual - test_pred), 4)
 
@@ -534,9 +652,15 @@ def _prediction_split_section(
                         if not pd.api.types.is_numeric_dtype(model_df[pred]):
                             one_df[pred] = one_df[pred].astype(str)
                     one_df = _add_polynomial_columns_to_new_data(one_df, poly_specs)
-                    pred_model_scale = full_result.predict(one_df)
-                    pred_original = _inverse_outcome_transform(pred_model_scale, outcome_transform)[0]
-                    st.success(f"Predicted {original_target}: {pred_original:.4f}")
+                    warn_df = _extrapolation_warnings(one_df, training_ranges)
+                    if not warn_df.empty:
+                        st.warning("This input is outside the training data range for at least one numeric predictor.")
+                        st.dataframe(warn_df, use_container_width=True)
+                    interval_out = _prediction_summary_on_original_scale(
+                        full_result, one_df, outcome_transform=outcome_transform, alpha=0.05
+                    )
+                    st.success(f"Predicted {original_target}: {interval_out.loc[0, 'Predicted']:.4f}")
+                    st.dataframe(interval_out.round(4), use_container_width=True)
                 except Exception as e:
                     st.error("Prediction failed: " + str(e))
 
@@ -558,10 +682,23 @@ def _prediction_split_section(
                 else:
                     pred_input = new_df.copy()
                     pred_input = _add_polynomial_columns_to_new_data(pred_input, poly_specs)
-                    new_pred_model_scale = full_result.predict(pred_input)
-                    new_pred = _inverse_outcome_transform(new_pred_model_scale, outcome_transform)
+                    warn_df = _extrapolation_warnings(pred_input, training_ranges)
+                    if not warn_df.empty:
+                        st.warning(
+                            "Some new-data values are outside the training ranges. "
+                            "These predictions may be extrapolations and less reliable."
+                        )
+                        with st.expander("Show extrapolation warnings", expanded=False):
+                            st.dataframe(warn_df, use_container_width=True)
+                    interval_out = _prediction_summary_on_original_scale(
+                        full_result, pred_input, outcome_transform=outcome_transform, alpha=0.05
+                    )
                     output_df = new_df.copy()
-                    output_df[f"predicted_{original_target}"] = np.round(new_pred, 4)
+                    output_df[f"predicted_{original_target}"] = np.round(interval_out["Predicted"].values, 4)
+                    output_df["mean_ci_lower"] = np.round(interval_out["Mean CI Lower"].values, 4)
+                    output_df["mean_ci_upper"] = np.round(interval_out["Mean CI Upper"].values, 4)
+                    output_df["prediction_pi_lower"] = np.round(interval_out["Prediction PI Lower"].values, 4)
+                    output_df["prediction_pi_upper"] = np.round(interval_out["Prediction PI Upper"].values, 4)
                     st.dataframe(output_df.head(50), use_container_width=True)
                     st.download_button(
                         "Download new-data predictions (CSV)",
@@ -705,8 +842,13 @@ def run_linear_regression(
     outcome_transform="None",
     polynomial_terms=None,
     center_polynomial_terms=True,
+    interaction_pairs=None,
+    compare_reduced_model=False,
+    reduced_model_predictors=None,
 ):
     polynomial_terms = polynomial_terms or []
+    interaction_pairs = interaction_pairs or []
+    reduced_model_predictors = reduced_model_predictors or []
     model_df = prepare_data(df, target, predictors)
     if model_df.empty:
         st.error("No data remaining after dropping missing values.")
@@ -737,16 +879,21 @@ def run_linear_regression(
                 "mean": float(pd.to_numeric(model_df[source_col], errors="coerce").mean()) if center_polynomial_terms else 0.0,
             })
     model_predictors = predictors + polynomial_feature_cols
-    formula = build_formula(model_target, model_predictors, model_df)
+    formula = build_linear_formula_with_interactions(
+        model_target, model_predictors, model_df, interaction_pairs=interaction_pairs
+    )
     result = smf.ols(formula=formula, data=model_df).fit()
 
     st.success("Model fitted successfully.")
     st.code(formula, language="text")
-    if outcome_transform != "None" or polynomial_notes:
+    if outcome_transform != "None" or polynomial_notes or interaction_pairs:
         msg = transform_note
         if polynomial_notes:
             msg += " " + " | ".join(polynomial_notes)
             msg += " These terms are used to handle possible non-linearity."
+        if interaction_pairs:
+            interaction_text = ", ".join([f"{a} × {b}" for a, b in interaction_pairs])
+            msg += f" Interaction term(s) added: {interaction_text}."
         st.info(msg)
 
     # Predictions from the full-data model are prepared once.
@@ -850,6 +997,11 @@ def run_linear_regression(
         max_v = max(float(model_df[model_target].max()), float(preds.max()))
         fig_fit.add_shape(type="line", x0=min_v, y0=min_v, x1=max_v, y1=max_v, line=dict(dash="dash"))
         st.plotly_chart(fig_fit, use_container_width=True)
+
+    if compare_reduced_model and reduced_model_predictors:
+        _nested_model_comparison_section(
+            result, model_df, model_target, reduced_model_predictors, interaction_pairs=interaction_pairs
+        )
 
     # Diagnostics
     if enable_prediction_split:
@@ -1244,7 +1396,353 @@ def run_linear_regression(
 # Binary Logistic Regression
 # ============================================================
 
-def run_logistic_regression(df, target, predictors, plot_template):
+
+def _logistic_event_guidance(y_true):
+    """Show event prevalence guidance, including when OR may approximate RR."""
+    event_rate = float(np.mean(y_true)) if len(y_true) else np.nan
+    st.markdown("#### Event prevalence and OR/RR guidance")
+    if np.isfinite(event_rate):
+        st.metric("Event rate", f"{event_rate * 100:.1f}%")
+        if event_rate < 0.10:
+            st.info("Event is rare (<10%). In this setting, Odds Ratio (OR) can approximately reflect Relative Risk (RR).")
+        else:
+            st.warning("Event is not rare (≥10%). OR can exaggerate the Relative Risk, so interpret OR carefully.")
+
+
+def _logistic_or_interpretation(tbl):
+    """Plain-language interpretation of odds ratios."""
+    rows = []
+    for _, row in tbl.iterrows():
+        term = str(row.get("Term", ""))
+        if term.lower() in ("intercept", "const"):
+            continue
+        if "Odds Ratio" not in row:
+            continue
+        try:
+            or_val = float(row["Odds Ratio"])
+            pval = float(row.get("P-value", np.nan))
+        except Exception:
+            continue
+        if np.isclose(or_val, 1.0, atol=0.01):
+            meaning = "approximately no change in the odds"
+        elif or_val > 1:
+            meaning = f"higher odds of the event by about {(or_val - 1) * 100:.1f}%"
+        else:
+            meaning = f"lower odds of the event by about {(1 - or_val) * 100:.1f}%"
+        significance = "statistically significant" if np.isfinite(pval) and pval < 0.05 else "not statistically significant"
+        rows.append({
+            "Term": term,
+            "OR": round(or_val, 4),
+            "Plain interpretation": (
+                f"Holding other predictors constant, {term} is associated with {meaning}. "
+                f"This association is {significance} (p={pval:.4f})."
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def _logistic_classification_metrics(y_true, probs, threshold=0.50):
+    """Return classification metrics table and confusion matrix for binary logistic regression."""
+    y_true = np.asarray(y_true).astype(int)
+    probs = np.asarray(probs, dtype=float)
+    preds = (probs >= float(threshold)).astype(int)
+    cm = confusion_matrix(y_true, preds, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    def safe_div(a, b):
+        return float(a / b) if b else np.nan
+
+    metrics = {
+        "Accuracy": accuracy_score(y_true, preds),
+        "Sensitivity / Recall": safe_div(tp, tp + fn),
+        "Specificity": safe_div(tn, tn + fp),
+        "Precision / PPV": safe_div(tp, tp + fp),
+        "NPV": safe_div(tn, tn + fn),
+        "F1-score": f1_score(y_true, preds, zero_division=0),
+    }
+    metrics_df = pd.DataFrame({
+        "Metric": list(metrics.keys()),
+        "Value": [round(v, 4) if np.isfinite(v) else np.nan for v in metrics.values()],
+    })
+    cm_df = pd.DataFrame(
+        cm,
+        index=["Actual 0", "Actual 1"],
+        columns=["Predicted 0", "Predicted 1"],
+    )
+    pred_class = pd.Series(preds)
+    return metrics_df, cm_df, preds
+
+
+def _plot_logistic_roc(y_true, probs, plot_template, title_prefix=""):
+    try:
+        auc = roc_auc_score(y_true, probs)
+        fpr, tpr, _ = roc_curve(y_true, probs)
+        fig_roc = px.line(
+            x=fpr,
+            y=tpr,
+            labels={"x": "False Positive Rate", "y": "True Positive Rate"},
+            title=f"{title_prefix}ROC Curve (AUC = {auc:.4f})",
+            template=plot_template,
+        )
+        fig_roc.add_shape(
+            type="line", x0=0, y0=0, x1=1, y1=1,
+            line=dict(dash="dash", color="grey"),
+        )
+        st.plotly_chart(fig_roc, use_container_width=True)
+        return auc
+    except Exception:
+        st.info("ROC curve could not be generated.")
+        return np.nan
+
+
+def _plot_logistic_calibration(y_true, probs, plot_template, title="Calibration Plot"):
+    try:
+        y_true = np.asarray(y_true).astype(float)
+        probs = np.asarray(probs).astype(float)
+        n_bins = 10
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        mean_pred, mean_true, counts = [], [], []
+        for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+            if hi == 1:
+                mask = (probs >= lo) & (probs <= hi)
+            else:
+                mask = (probs >= lo) & (probs < hi)
+            if mask.sum() > 0:
+                mean_pred.append(float(probs[mask].mean()))
+                mean_true.append(float(y_true[mask].mean()))
+                counts.append(int(mask.sum()))
+        fig_cal = go.Figure()
+        fig_cal.add_trace(go.Scatter(
+            x=mean_pred,
+            y=mean_true,
+            mode="markers+lines",
+            text=[f"n={c}" for c in counts],
+            name="Calibration",
+        ))
+        fig_cal.add_shape(
+            type="line", x0=0, y0=0, x1=1, y1=1,
+            line=dict(dash="dash", color="red"),
+        )
+        fig_cal.update_layout(
+            title=title,
+            xaxis_title="Mean predicted probability",
+            yaxis_title="Observed event rate",
+            template=plot_template,
+        )
+        st.plotly_chart(fig_cal, use_container_width=True)
+    except Exception:
+        st.info("Calibration plot could not be generated.")
+
+
+def _hosmer_lemeshow_test(y_true, probs, g=10):
+    """Hosmer-Lemeshow goodness-of-fit test; p > 0.05 is generally desirable."""
+    y_true = pd.Series(np.asarray(y_true).astype(float))
+    probs = pd.Series(np.asarray(probs).astype(float))
+    try:
+        quantiles = pd.qcut(probs, g, duplicates="drop")
+        hl_df = pd.DataFrame({"obs": y_true.values, "pred": probs.values, "bin": quantiles})
+        hl_tbl = hl_df.groupby("bin", observed=False).agg(
+            obs_1=("obs", "sum"),
+            pred_1=("pred", "sum"),
+            n=("obs", "count"),
+        )
+        hl_tbl["obs_0"] = hl_tbl["n"] - hl_tbl["obs_1"]
+        hl_tbl["pred_0"] = hl_tbl["n"] - hl_tbl["pred_1"]
+        hl_tbl = hl_tbl[(hl_tbl["pred_1"] > 0) & (hl_tbl["pred_0"] > 0)]
+        if len(hl_tbl) < 3:
+            return np.nan, np.nan
+        hl_stat = (
+            ((hl_tbl["obs_1"] - hl_tbl["pred_1"]) ** 2 / hl_tbl["pred_1"]).sum()
+            + ((hl_tbl["obs_0"] - hl_tbl["pred_0"]) ** 2 / hl_tbl["pred_0"]).sum()
+        )
+        df_hl = max(len(hl_tbl) - 2, 1)
+        hl_pval = 1 - stats.chi2.cdf(hl_stat, df=df_hl)
+        return float(hl_stat), float(hl_pval)
+    except Exception:
+        return np.nan, np.nan
+
+
+def _logistic_vif_table(result):
+    """VIF after formula encoding, including categorical dummy variables."""
+    exog = pd.DataFrame(result.model.exog, columns=result.model.exog_names)
+    exog = exog.loc[:, exog.nunique(dropna=True) > 1]
+    exog_no_intercept = exog.drop(columns=["Intercept"], errors="ignore")
+    if exog_no_intercept.shape[1] < 2:
+        return pd.DataFrame()
+    X_vif = sm.add_constant(exog_no_intercept, has_constant="add")
+    rows = []
+    for i, col in enumerate(X_vif.columns):
+        if col == "const":
+            continue
+        try:
+            val = variance_inflation_factor(X_vif.values, i)
+        except Exception:
+            val = np.nan
+        rows.append({"Variable": col, "VIF": round(float(val), 3) if np.isfinite(val) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def _logistic_predict_on_new_data(model_df, target, predictors, result, threshold):
+    st.markdown("### Predict on New Data")
+    st.caption(
+        "Use the fitted full-data logistic model to predict event probability for new observations. "
+        "New data must contain the same predictor columns."
+    )
+
+    with st.expander("Manual single prediction", expanded=False):
+        manual_values = {}
+        cols = st.columns(2)
+        for i, pred in enumerate(predictors):
+            with cols[i % 2]:
+                if pd.api.types.is_numeric_dtype(model_df[pred]):
+                    default_val = float(pd.to_numeric(model_df[pred], errors="coerce").median())
+                    manual_values[pred] = st.number_input(
+                        pred,
+                        value=default_val,
+                        key=f"log_manual_pred_{pred}",
+                    )
+                else:
+                    vals = model_df[pred].dropna().astype(str).unique().tolist()
+                    vals = sorted(vals) if vals else [""]
+                    manual_values[pred] = st.selectbox(
+                        pred,
+                        vals,
+                        key=f"log_manual_pred_{pred}",
+                    )
+        if st.button("Predict single row", key="log_predict_single", use_container_width=True):
+            try:
+                one_df = pd.DataFrame([manual_values])
+                for pred in predictors:
+                    if not pd.api.types.is_numeric_dtype(model_df[pred]):
+                        one_df[pred] = one_df[pred].astype(str)
+                prob = float(result.predict(one_df).iloc[0] if hasattr(result.predict(one_df), "iloc") else result.predict(one_df)[0])
+                pred_class = int(prob >= threshold)
+                st.success(f"Predicted probability of event: {prob:.4f} | Predicted class at threshold {threshold:.2f}: {pred_class}")
+            except Exception as e:
+                st.error("Prediction failed: " + str(e))
+
+    uploaded_new = st.file_uploader(
+        "Upload new data for logistic prediction (CSV or Excel)",
+        type=["csv", "xlsx", "xls"],
+        key="log_new_prediction_file",
+    )
+    if uploaded_new is not None:
+        try:
+            if uploaded_new.name.lower().endswith(".csv"):
+                new_df = pd.read_csv(uploaded_new)
+            else:
+                new_df = pd.read_excel(uploaded_new)
+            missing_cols = [c for c in predictors if c not in new_df.columns]
+            if missing_cols:
+                st.error("New data is missing required columns: " + ", ".join(missing_cols))
+            else:
+                pred_input = new_df.copy()
+                probs_new = np.asarray(result.predict(pred_input), dtype=float)
+                output_df = new_df.copy()
+                output_df[f"predicted_probability_{target}"] = np.round(probs_new, 4)
+                output_df[f"predicted_class_{target}"] = (probs_new >= threshold).astype(int)
+                st.dataframe(output_df.head(50), use_container_width=True)
+                st.download_button(
+                    "Download logistic predictions (CSV)",
+                    data=output_df.to_csv(index=False).encode(),
+                    file_name=f"logistic_predictions_{target}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+        except Exception as e:
+            st.error("New-data prediction failed: " + str(e))
+
+
+def _logistic_prediction_workflow(model_df, target, predictors, formula, full_result, test_size, random_state, threshold, plot_template):
+    st.markdown("## Logistic Prediction / Validation Workflow")
+    st.info(
+        "Prediction mode evaluates probability and classification performance on a held-out test set. "
+        "Use the threshold slider to choose the probability cutoff for classifying event vs no event."
+    )
+    if len(model_df) < 30:
+        st.warning("Train/test split may be unstable with small datasets. Use at least 30 observations, preferably more.")
+        return
+    try:
+        train_df, test_df = train_test_split(
+            model_df,
+            test_size=float(test_size),
+            random_state=int(random_state),
+            stratify=model_df[target] if model_df[target].nunique() == 2 else None,
+        )
+        train_result = smf.logit(formula=formula, data=train_df).fit(disp=False)
+        train_probs = np.asarray(train_result.predict(train_df), dtype=float)
+        test_probs = np.asarray(train_result.predict(test_df), dtype=float)
+        y_train = train_df[target].astype(int).values
+        y_test = test_df[target].astype(int).values
+
+        train_auc = roc_auc_score(y_train, train_probs) if len(np.unique(y_train)) == 2 else np.nan
+        test_auc = roc_auc_score(y_test, test_probs) if len(np.unique(y_test)) == 2 else np.nan
+        brier = brier_score_loss(y_test, test_probs)
+        ll = log_loss(y_test, test_probs, labels=[0, 1])
+        metrics_df, cm_df, test_classes = _logistic_classification_metrics(y_test, test_probs, threshold)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Train N", len(train_df))
+        c2.metric("Test N", len(test_df))
+        c3.metric("Test AUC", round(test_auc, 4) if np.isfinite(test_auc) else "NA")
+        c4.metric("Brier Score", round(brier, 4))
+        c5.metric("Log Loss", round(ll, 4))
+
+        st.markdown("### Classification metrics on test set")
+        st.caption(f"Classification threshold = {threshold:.2f}. Lower threshold usually increases sensitivity; higher threshold usually increases specificity.")
+        st.dataframe(metrics_df, use_container_width=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            fig_cm = px.imshow(
+                cm_df,
+                text_auto=True,
+                aspect="auto",
+                title="Test-set Confusion Matrix",
+                color_continuous_scale="Blues",
+            )
+            st.plotly_chart(fig_cm, use_container_width=True)
+        with col_b:
+            _plot_logistic_roc(y_test, test_probs, plot_template, title_prefix="Test-set ")
+
+        _plot_logistic_calibration(y_test, test_probs, plot_template, title="Test-set Calibration Plot")
+
+        pred_tbl = test_df[predictors].copy()
+        pred_tbl["Actual"] = y_test
+        pred_tbl["Predicted probability"] = np.round(test_probs, 4)
+        pred_tbl["Predicted class"] = test_classes
+        pred_tbl["Correct?"] = (test_classes == y_test)
+        with st.expander("Optional: Test-set prediction table and download", expanded=False):
+            st.dataframe(pred_tbl.head(50), use_container_width=True)
+            st.download_button(
+                "Download logistic test predictions (CSV)",
+                data=pred_tbl.to_csv(index=False).encode(),
+                file_name="logistic_test_predictions.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        if np.isfinite(train_auc) and np.isfinite(test_auc) and train_auc - test_auc > 0.10:
+            st.warning("Train AUC is meaningfully higher than Test AUC. This may suggest overfitting.")
+        elif np.isfinite(test_auc):
+            st.success("Prediction performance is evaluated on held-out test data.")
+
+        _logistic_predict_on_new_data(model_df, target, predictors, full_result, threshold)
+
+    except Exception as e:
+        st.warning("Logistic train/test prediction workflow could not be completed: " + str(e))
+
+
+def run_logistic_regression(
+    df,
+    target,
+    predictors,
+    plot_template,
+    enable_prediction_split=False,
+    test_size=0.20,
+    split_random_state=42,
+    classification_threshold=0.50,
+):
     model_df = prepare_data(df, target, predictors)
     if model_df.empty:
         st.error("No data remaining after dropping missing values.")
@@ -1261,183 +1759,181 @@ def run_logistic_regression(df, target, predictors, plot_template):
         model_df[target] = model_df[target].map({sorted_cls[0]: 0, sorted_cls[1]: 1})
         st.info(f"Target encoded: {sorted_cls[0]} → 0, {sorted_cls[1]} → 1")
 
+    y_true_full = model_df[target].astype(int)
     formula = build_formula(target, predictors, model_df)
     result = smf.logit(formula=formula, data=model_df).fit(disp=False)
 
-    st.success("✅ Model fitted successfully.")
+    st.success("✅ Logistic model fitted successfully.")
     st.code(formula, language="text")
 
-    # ── Fit metrics ─────────────────────────────────────────
-    # McFadden pseudo R²
-    mcfadden = 1 - (result.llf / result.llnull)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("N", int(result.nobs))
-    c2.metric("McFadden R²", round(mcfadden, 4))
-    c3.metric("AIC", round(result.aic, 2))
-    c4.metric("Log-Likelihood", round(result.llf, 2))
+    # Core model fit metrics
+    mcfadden = 1 - (result.llf / result.llnull) if result.llnull != 0 else np.nan
+    null_deviance = -2 * result.llnull
+    residual_deviance = -2 * result.llf
+    dev_reduction = (null_deviance - residual_deviance) / null_deviance * 100 if null_deviance else np.nan
+    bic_val = getattr(result, "bic", np.nan)
+    probs_full = np.asarray(result.predict(model_df), dtype=float)
 
-    # ── Coefficients with OR ─────────────────────────────────
+    if enable_prediction_split:
+        st.markdown("## Logistic Prediction Focus Mode")
+        _logistic_prediction_workflow(
+            model_df=model_df,
+            target=target,
+            predictors=predictors,
+            formula=formula,
+            full_result=result,
+            test_size=test_size,
+            random_state=split_random_state,
+            threshold=classification_threshold,
+            plot_template=plot_template,
+        )
+        with st.expander("Optional: Logistic inference summary", expanded=False):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("N", int(result.nobs))
+            c2.metric("McFadden R²", round(mcfadden, 4) if np.isfinite(mcfadden) else "NA")
+            c3.metric("AIC", round(result.aic, 2))
+            c4.metric("BIC", round(bic_val, 2) if np.isfinite(bic_val) else "NA")
+            tbl = coef_table(result, "Binary Logistic Regression")
+            st.dataframe(tbl, use_container_width=True)
+            interp = _logistic_or_interpretation(tbl)
+            if not interp.empty:
+                st.dataframe(interp, use_container_width=True)
+        return
+
+    # Inference / explanation mode
+    st.markdown("### Model Fit Summary")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("N", int(result.nobs))
+    c2.metric("McFadden R²", round(mcfadden, 4) if np.isfinite(mcfadden) else "NA")
+    c3.metric("AIC", round(result.aic, 2))
+    c4.metric("BIC", round(bic_val, 2) if np.isfinite(bic_val) else "NA")
+    c5.metric("Log-Likelihood", round(result.llf, 2))
+
+    st.markdown("#### Null vs Residual Deviance")
+    dev_df = pd.DataFrame({
+        "Metric": ["Null Deviance", "Residual Deviance", "Deviance reduction %", "Likelihood ratio p-value"],
+        "Value": [
+            round(null_deviance, 4),
+            round(residual_deviance, 4),
+            round(dev_reduction, 2) if np.isfinite(dev_reduction) else np.nan,
+            round(float(result.llr_pvalue), 6) if hasattr(result, "llr_pvalue") else np.nan,
+        ],
+        "Interpretation": [
+            "Model with intercept only.",
+            "Full model; lower than null deviance is better.",
+            "How much deviance was reduced by adding predictors.",
+            "Tests whether predictors improve fit over intercept-only model.",
+        ],
+    })
+    st.dataframe(dev_df, use_container_width=True)
+
+    # Coefficients with OR
     st.markdown("### Coefficients + Odds Ratios")
     tbl = coef_table(result, "Binary Logistic Regression")
     st.dataframe(tbl, use_container_width=True)
     download_buttons(result, tbl, "Binary Logistic Regression")
 
-    # ── Predictions & evaluation ─────────────────────────────
-    probs = result.predict(model_df)
-    preds_class = (probs >= 0.5).astype(int)
-    y_true = model_df[target]
+    interp = _logistic_or_interpretation(tbl)
+    if not interp.empty:
+        with st.expander("Plain-language OR interpretation", expanded=True):
+            st.dataframe(interp, use_container_width=True)
 
-    acc = accuracy_score(y_true, preds_class)
-    st.metric("Accuracy", round(acc, 4))
+    _logistic_event_guidance(y_true_full)
+
+    # Full-data probability and classification evaluation
+    st.markdown("### Probability and Classification Performance")
+    try:
+        auc = roc_auc_score(y_true_full, probs_full)
+    except Exception:
+        auc = np.nan
+    try:
+        brier = brier_score_loss(y_true_full, probs_full)
+    except Exception:
+        brier = np.nan
+    try:
+        ll = log_loss(y_true_full, probs_full, labels=[0, 1])
+    except Exception:
+        ll = np.nan
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("AUC", round(auc, 4) if np.isfinite(auc) else "NA")
+    c2.metric("Brier Score", round(brier, 4) if np.isfinite(brier) else "NA")
+    c3.metric("Log Loss", round(ll, 4) if np.isfinite(ll) else "NA")
+    st.caption("AUC higher is better. Brier Score and Log Loss lower are better.")
+
+    st.markdown("#### Classification at selected threshold")
+    st.caption(f"Current threshold = {classification_threshold:.2f}. Change it in Logistic Regression options.")
+    metrics_df, cm_df, preds_class = _logistic_classification_metrics(y_true_full, probs_full, classification_threshold)
+    st.dataframe(metrics_df, use_container_width=True)
 
     col_a, col_b = st.columns(2)
     with col_a:
-        # Confusion matrix
-        cm = confusion_matrix(y_true, preds_class)
-        cm_df = pd.DataFrame(
-            cm,
-            index=["Actual 0", "Actual 1"],
-            columns=["Predicted 0", "Predicted 1"],
-        )
         fig_cm = px.imshow(
-            cm_df, text_auto=True, aspect="auto",
-            title="Confusion Matrix", color_continuous_scale="Blues",
+            cm_df,
+            text_auto=True,
+            aspect="auto",
+            title="Confusion Matrix",
+            color_continuous_scale="Blues",
         )
         st.plotly_chart(fig_cm, use_container_width=True)
-
     with col_b:
-        # ROC
-        try:
-            auc = roc_auc_score(y_true, probs)
-            fpr, tpr, _ = roc_curve(y_true, probs)
-            fig_roc = px.line(
-                x=fpr, y=tpr,
-                labels={"x": "False Positive Rate", "y": "True Positive Rate"},
-                title=f"ROC Curve (AUC = {auc:.4f})",
-                template=plot_template,
-            )
-            fig_roc.add_shape(
-                type="line", x0=0, y0=0, x1=1, y1=1,
-                line=dict(dash="dash", color="grey"),
-            )
-            st.plotly_chart(fig_roc, use_container_width=True)
-        except Exception:
-            st.info("ROC curve could not be generated.")
+        _plot_logistic_roc(y_true_full, probs_full, plot_template)
 
-    # Classification report
-    st.markdown("#### Classification Report")
-    st.dataframe(
-        pd.DataFrame(classification_report(y_true, preds_class, output_dict=True)).T,
-        use_container_width=True,
-    )
+    _plot_logistic_calibration(y_true_full, probs_full, plot_template)
 
-    # Calibration plot
-    st.markdown("#### Calibration Plot")
-    n_bins = 10
-    bin_edges = np.linspace(0, 1, n_bins + 1)
-    bin_mid = (bin_edges[:-1] + bin_edges[1:]) / 2
-    mean_pred, mean_true = [], []
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (probs >= lo) & (probs < hi)
-        if mask.sum() > 0:
-            mean_pred.append(probs[mask].mean())
-            mean_true.append(y_true[mask].mean())
-    fig_cal = go.Figure()
-    fig_cal.add_trace(go.Scatter(
-        x=mean_pred, y=mean_true, mode="markers+lines", name="Calibration",
-    ))
-    fig_cal.add_shape(
-        type="line", x0=0, y0=0, x1=1, y1=1,
-        line=dict(dash="dash", color="red"),
-    )
-    fig_cal.update_layout(
-        title="Calibration Plot",
-        xaxis_title="Mean Predicted Probability",
-        yaxis_title="Fraction of Positives",
-        template=plot_template,
-    )
-    st.plotly_chart(fig_cal, use_container_width=True)
-
-    # ── Diagnostics ──────────────────────────────────────────
+    # Diagnostics
     st.markdown("### 🔬 Diagnostics")
     issues = []
 
-    # Class balance
-    class_counts = y_true.value_counts()
-    minority_pct = class_counts.min() / len(y_true) * 100
+    class_counts = y_true_full.value_counts().sort_index()
+    minority_pct = class_counts.min() / len(y_true_full) * 100
     st.markdown(
         f"**Class balance:** {class_counts.to_dict()} "
         f"(minority class = {minority_pct:.1f}%)"
     )
     if minority_pct < 20:
         issues.append({
-            "level": "error",
+            "level": "warning",
             "msg": f"Class imbalance — minority class is only {minority_pct:.1f}% of data.",
-            "fix": "Use class_weight='balanced', oversample with SMOTE, "
-                   "or use Penalized Logistic Regression (Firth method).",
+            "fix": "Consider threshold tuning, stratified split, resampling, or class-weighted models for prediction.",
         })
 
-    # Hosmer-Lemeshow test
-    try:
-        g = 10
-        quantiles = pd.qcut(probs, g, duplicates="drop")
-        hl_df = pd.DataFrame({"obs": y_true.values, "pred": probs.values, "bin": quantiles})
-        hl_tbl = hl_df.groupby("bin").agg(
-            obs_1=("obs", "sum"),
-            pred_1=("pred", "sum"),
-            n=("obs", "count"),
-        )
-        hl_tbl["obs_0"] = hl_tbl["n"] - hl_tbl["obs_1"]
-        hl_tbl["pred_0"] = hl_tbl["n"] - hl_tbl["pred_1"]
-        hl_stat = (
-            ((hl_tbl["obs_1"] - hl_tbl["pred_1"]) ** 2 / hl_tbl["pred_1"]).sum()
-            + ((hl_tbl["obs_0"] - hl_tbl["pred_0"]) ** 2 / hl_tbl["pred_0"]).sum()
-        )
-        hl_pval = 1 - stats.chi2.cdf(hl_stat, df=g - 2)
-        st.markdown(
-            f"**Hosmer-Lemeshow test** — χ² = `{hl_stat:.4f}`, "
-            f"p-value = `{hl_pval:.4f}` (good fit if p > 0.05)"
-        )
+    hl_stat, hl_pval = _hosmer_lemeshow_test(y_true_full, probs_full, g=10)
+    if np.isfinite(hl_pval):
+        st.markdown(f"**Hosmer-Lemeshow test** — χ² = `{hl_stat:.4f}`, p-value = `{hl_pval:.4f}` (good calibration if p > 0.05)")
         if hl_pval < 0.05:
             issues.append({
                 "level": "warning",
-                "msg": f"Hosmer-Lemeshow test suggests poor calibration (p = {hl_pval:.4f}).",
-                "fix": "Add non-linear terms, interaction effects, or additional predictors.",
+                "msg": f"Hosmer-Lemeshow suggests poor calibration (p = {hl_pval:.4f}).",
+                "fix": "Add non-linear terms, interactions, more predictors, or consider calibration methods.",
             })
-    except Exception:
-        pass
+    else:
+        st.info("Hosmer-Lemeshow test could not be calculated.")
 
-    # McFadden R² guidance
-    if mcfadden < 0.1:
-        issues.append({
-            "level": "warning",
-            "msg": f"McFadden R² = {mcfadden:.4f} — model has low explanatory power.",
-            "fix": "Consider adding more relevant predictors or interaction terms.",
-        })
-
-    # VIF
     try:
-        num_preds = model_df[predictors].select_dtypes(include=np.number).columns.tolist()
-        if len(num_preds) >= 2:
-            X_vif = sm.add_constant(model_df[num_preds].dropna())
-            vif_data = pd.DataFrame({
-                "Variable": num_preds,
-                "VIF": [
-                    variance_inflation_factor(X_vif.values, i + 1)
-                    for i in range(len(num_preds))
-                ],
-            }).round(3)
-            st.markdown("#### VIF (numeric predictors)")
+        vif_data = _logistic_vif_table(result)
+        if not vif_data.empty:
+            st.markdown("#### Multicollinearity: VIF")
+            st.caption("VIF is calculated after formula encoding, so categorical predictors are checked through dummy variables.")
             st.dataframe(vif_data, use_container_width=True)
             high_vif = vif_data[vif_data["VIF"] > 10]
             if not high_vif.empty:
                 issues.append({
                     "level": "error",
-                    "msg": f"Multicollinearity (VIF > 10): {', '.join(high_vif['Variable'].tolist())}",
-                    "fix": "Remove or combine correlated predictors.",
+                    "msg": f"Multicollinearity detected (VIF > 10): {', '.join(high_vif['Variable'].astype(str).tolist())}",
+                    "fix": "Remove or combine highly correlated predictors.",
                 })
     except Exception:
         pass
+
+    if mcfadden < 0.1:
+        issues.append({
+            "level": "warning",
+            "msg": f"McFadden R² = {mcfadden:.4f} — model has low explanatory power.",
+            "fix": "Consider adding more relevant predictors, non-linear terms, or interaction terms.",
+        })
+
+    _logistic_predict_on_new_data(model_df, target, predictors, result, classification_threshold)
 
     st.markdown("### 🩺 Diagnostic Summary")
     show_diagnostics_header(issues)
@@ -1450,8 +1946,244 @@ def run_logistic_regression(df, target, predictors, plot_template):
 # Poisson Regression
 # ============================================================
 
-def run_poisson_regression(df, target, predictors, plot_template):
-    model_df = prepare_data(df, target, predictors)
+def _poisson_irr_interpretation(tbl):
+    """Plain-language interpretation for incidence rate ratios."""
+    rows = []
+    if "IRR" not in tbl.columns:
+        return pd.DataFrame(rows)
+    for _, row in tbl.iterrows():
+        term = str(row.get("Term", ""))
+        if term.lower() in ("intercept", "const"):
+            continue
+        irr = float(row.get("IRR", np.nan))
+        pval = float(row.get("P-value", np.nan))
+        if not np.isfinite(irr):
+            continue
+        if irr > 1:
+            pct = (irr - 1) * 100
+            meaning = f"higher event rate by about {pct:.1f}%"
+        elif irr < 1:
+            pct = (1 - irr) * 100
+            meaning = f"lower event rate by about {pct:.1f}%"
+        else:
+            meaning = "no change in event rate"
+        significance = "statistically significant" if np.isfinite(pval) and pval < 0.05 else "not statistically significant"
+        rows.append({
+            "Term": term,
+            "IRR": round(irr, 4),
+            "Plain interpretation": (
+                f"Holding other predictors constant, this term is associated with {meaning}. "
+                f"The association is {significance}."
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def _poisson_extrapolation_warnings(train_df, new_df, predictors):
+    """Return warnings when new numeric values are outside the training range."""
+    warnings = []
+    for col in predictors:
+        if col in train_df.columns and col in new_df.columns and pd.api.types.is_numeric_dtype(train_df[col]):
+            train_vals = pd.to_numeric(train_df[col], errors="coerce")
+            new_vals = pd.to_numeric(new_df[col], errors="coerce")
+            lo = float(train_vals.min())
+            hi = float(train_vals.max())
+            below = int((new_vals < lo).sum())
+            above = int((new_vals > hi).sum())
+            if below or above:
+                warnings.append(f"{col}: {below} value(s) below training min {lo:.4f}, {above} above training max {hi:.4f}")
+    return warnings
+
+
+def _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=None):
+    """Manual and file-based prediction for Poisson models."""
+    st.markdown("### Predict on New Data")
+    st.caption(
+        "New data must contain the same predictor columns used in the model. "
+        "If an exposure/offset was used, the new data must also include that exposure column."
+    )
+
+    required_cols = list(predictors) + ([exposure_col] if exposure_col else [])
+
+    with st.expander("Manual single prediction", expanded=False):
+        manual_values = {}
+        cols = st.columns(2)
+        for i, pred in enumerate(required_cols):
+            with cols[i % 2]:
+                if pred == exposure_col:
+                    default_val = float(pd.to_numeric(model_df[pred], errors="coerce").median())
+                    manual_values[pred] = st.number_input(
+                        f"{pred} (exposure)",
+                        min_value=0.000001,
+                        value=max(default_val, 0.000001),
+                        key=f"pois_manual_exposure_{pred}",
+                    )
+                elif pd.api.types.is_numeric_dtype(model_df[pred]):
+                    default_val = float(pd.to_numeric(model_df[pred], errors="coerce").median())
+                    manual_values[pred] = st.number_input(pred, value=default_val, key=f"pois_manual_{pred}")
+                else:
+                    vals = model_df[pred].dropna().astype(str).unique().tolist()
+                    vals = sorted(vals) if vals else [""]
+                    manual_values[pred] = st.selectbox(pred, vals, key=f"pois_manual_{pred}")
+        if st.button("Predict count", key="pois_predict_single", use_container_width=True):
+            try:
+                one_df = pd.DataFrame([manual_values])
+                for pred in predictors:
+                    if not pd.api.types.is_numeric_dtype(model_df[pred]):
+                        one_df[pred] = one_df[pred].astype(str)
+                offset = None
+                if exposure_col:
+                    if (one_df[exposure_col] <= 0).any():
+                        st.error("Exposure values must be greater than 0.")
+                        return
+                    offset = np.log(one_df[exposure_col].astype(float))
+                warn = _poisson_extrapolation_warnings(model_df, one_df, predictors)
+                if warn:
+                    st.warning("Extrapolation warning: " + " | ".join(warn))
+                pred_count = float(result.predict(one_df, offset=offset).iloc[0])
+                st.success(f"Predicted {target}: {pred_count:.4f}")
+                if exposure_col:
+                    exposure_value = float(one_df[exposure_col].iloc[0])
+                    st.info(f"Predicted rate per exposure unit: {pred_count / exposure_value:.4f}")
+            except Exception as e:
+                st.error("Prediction failed: " + str(e))
+
+    uploaded_new = st.file_uploader(
+        "Upload new data for Poisson prediction (CSV or Excel)",
+        type=["csv", "xlsx", "xls"],
+        key="pois_new_prediction_file",
+    )
+    if uploaded_new is not None:
+        try:
+            if uploaded_new.name.lower().endswith(".csv"):
+                new_df = pd.read_csv(uploaded_new)
+            else:
+                new_df = pd.read_excel(uploaded_new)
+            missing_cols = [c for c in required_cols if c not in new_df.columns]
+            if missing_cols:
+                st.error("New data is missing required columns: " + ", ".join(missing_cols))
+                return
+            pred_input = new_df.copy()
+            offset = None
+            if exposure_col:
+                if (pd.to_numeric(pred_input[exposure_col], errors="coerce") <= 0).any():
+                    st.error("Exposure values must be greater than 0 in the uploaded file.")
+                    return
+                offset = np.log(pd.to_numeric(pred_input[exposure_col], errors="coerce"))
+            warn = _poisson_extrapolation_warnings(model_df, pred_input, predictors)
+            if warn:
+                st.warning("Extrapolation warning: " + " | ".join(warn))
+            pred_counts = result.predict(pred_input, offset=offset)
+            output_df = new_df.copy()
+            output_df[f"predicted_{target}"] = np.round(pred_counts, 4)
+            if exposure_col:
+                output_df[f"predicted_rate_per_{exposure_col}"] = np.round(pred_counts / pd.to_numeric(output_df[exposure_col], errors="coerce"), 4)
+            st.dataframe(output_df.head(50), use_container_width=True)
+            st.download_button(
+                "Download Poisson predictions (CSV)",
+                data=output_df.to_csv(index=False).encode(),
+                file_name=f"poisson_predicted_{target}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error("New-data prediction failed: " + str(e))
+
+
+def _poisson_prediction_section(model_df, target, predictors, formula, full_result, test_size, random_state, plot_template, exposure_col=None):
+    """Train/test validation for Poisson count prediction."""
+    st.markdown("## Poisson Prediction / Validation Workflow")
+    st.info(
+        "Prediction mode trains the Poisson model on a training set and evaluates count prediction on a held-out test set."
+    )
+    if len(model_df) < 20:
+        st.warning("Train/test split is not reliable with very small datasets. Use at least 20 observations, preferably more.")
+        return
+    try:
+        train_df, test_df = train_test_split(model_df, test_size=float(test_size), random_state=int(random_state))
+        train_offset = np.log(train_df[exposure_col].astype(float)) if exposure_col else None
+        test_offset = np.log(test_df[exposure_col].astype(float)) if exposure_col else None
+        train_result = smf.glm(
+            formula=formula,
+            data=train_df,
+            family=sm.families.Poisson(),
+            offset=train_offset,
+        ).fit()
+        y_train = train_df[target].astype(float).values
+        y_test = test_df[target].astype(float).values
+        train_pred = np.asarray(train_result.predict(train_df, offset=train_offset), dtype=float)
+        test_pred = np.asarray(train_result.predict(test_df, offset=test_offset), dtype=float)
+        train_pred = np.clip(train_pred, 1e-12, None)
+        test_pred = np.clip(test_pred, 1e-12, None)
+        train_mae = float(mean_absolute_error(y_train, train_pred))
+        test_mae = float(mean_absolute_error(y_test, test_pred))
+        rmse = float(np.sqrt(mean_squared_error(y_test, test_pred)))
+        mpd = float(mean_poisson_deviance(y_test, test_pred))
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Train N", len(train_df))
+        c2.metric("Test N", len(test_df))
+        c3.metric("Test MAE", round(test_mae, 4))
+        c4.metric("Test RMSE", round(rmse, 4))
+        c5.metric("Mean Poisson Deviance", round(mpd, 4))
+        st.caption("For MAE, RMSE, and Mean Poisson Deviance, lower is better.")
+        if test_mae > train_mae * 1.5 and len(train_df) > 0:
+            st.warning("Test MAE is much higher than Train MAE. This may indicate unstable prediction or overfitting.")
+        else:
+            st.success("Train and test count prediction errors are reasonably consistent.")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            fig = px.scatter(
+                x=y_test, y=test_pred,
+                labels={"x": "Actual test counts", "y": "Predicted test counts"},
+                title="Test Set: Actual vs Predicted Count",
+                template=plot_template,
+            )
+            max_v = max(float(np.nanmax(y_test)), float(np.nanmax(test_pred)))
+            fig.add_shape(type="line", x0=0, y0=0, x1=max_v, y1=max_v, line=dict(dash="dash"))
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            error = y_test - test_pred
+            fig_err = px.scatter(
+                x=test_pred, y=error,
+                labels={"x": "Predicted test counts", "y": "Prediction error"},
+                title="Test Set: Prediction Error vs Predicted",
+                template=plot_template,
+            )
+            fig_err.add_hline(y=0, line_dash="dash")
+            st.plotly_chart(fig_err, use_container_width=True)
+
+        pred_tbl = test_df[predictors + ([exposure_col] if exposure_col else [])].copy()
+        pred_tbl["Actual"] = np.round(y_test, 4)
+        pred_tbl["Predicted"] = np.round(test_pred, 4)
+        pred_tbl["Error"] = np.round(y_test - test_pred, 4)
+        pred_tbl["Absolute Error"] = np.round(np.abs(y_test - test_pred), 4)
+        with st.expander("Optional: Test-set prediction table and download", expanded=False):
+            st.dataframe(pred_tbl.head(50), use_container_width=True)
+            st.download_button(
+                "Download Poisson test predictions (CSV)",
+                data=pred_tbl.to_csv(index=False).encode(),
+                file_name="poisson_test_predictions.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+    except Exception as e:
+        st.warning("Poisson train/test prediction workflow could not be completed: " + str(e))
+
+
+def run_poisson_regression(
+    df,
+    target,
+    predictors,
+    plot_template,
+    enable_prediction_split=False,
+    test_size=0.20,
+    split_random_state=42,
+    exposure_col=None,
+    compare_negative_binomial=True,
+):
+    cols = [target] + predictors + ([exposure_col] if exposure_col else [])
+    model_df = df[cols].dropna().copy()
     if model_df.empty:
         st.error("No data remaining after dropping missing values.")
         return
@@ -1460,82 +2192,223 @@ def run_poisson_regression(df, target, predictors, plot_template):
         st.error("Poisson Regression requires a numeric count outcome.")
         return
     if (model_df[target] < 0).any():
-        st.error("Poisson Regression requires non-negative values.")
+        st.error("Poisson Regression requires non-negative count values.")
         return
+    if not np.allclose(model_df[target], np.round(model_df[target])):
+        st.warning("Poisson outcomes are usually integer counts. Your target has non-integer values; check whether Poisson is appropriate.")
+
+    offset = None
+    if exposure_col:
+        if not pd.api.types.is_numeric_dtype(model_df[exposure_col]):
+            st.error("Exposure / offset variable must be numeric.")
+            return
+        if (model_df[exposure_col] <= 0).any():
+            st.error("Exposure / offset variable must be greater than 0.")
+            return
+        offset = np.log(model_df[exposure_col].astype(float))
+        st.info(f"Using exposure offset: offset(log({exposure_col})). The model estimates event rates adjusted for exposure.")
 
     mean_t = model_df[target].mean()
     var_t = model_df[target].var()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Mean", round(mean_t, 3))
-    c2.metric("Variance", round(var_t, 3))
-    c3.metric("Var/Mean ratio", round(var_t / mean_t, 3) if mean_t > 0 else "—")
-
-    if var_t > mean_t * 1.5:
-        st.warning(
-            "⚠️ Variance >> Mean — Overdispersion likely. "
-            "Consider Negative Binomial Regression instead."
-        )
+    var_mean_ratio = var_t / mean_t if mean_t > 0 else np.nan
 
     formula = build_formula(target, predictors, model_df)
     result = smf.glm(
-        formula=formula, data=model_df, family=sm.families.Poisson()
+        formula=formula,
+        data=model_df,
+        family=sm.families.Poisson(),
+        offset=offset,
     ).fit()
 
-    st.success("✅ Model fitted successfully.")
-    st.code(formula, language="text")
+    st.success("✅ Poisson model fitted successfully.")
+    st.code(formula + (f" + offset(log({exposure_col}))" if exposure_col else ""), language="text")
 
-    c1, c2, c3 = st.columns(3)
+    pearson_disp = float(result.pearson_chi2 / result.df_resid) if result.df_resid else np.nan
+    deviance_disp = float(result.deviance / result.df_resid) if result.df_resid else np.nan
+    bic_val = getattr(result, "bic_llf", np.nan)
+    if not np.isfinite(bic_val):
+        try:
+            bic_val = result.bic
+        except Exception:
+            bic_val = np.nan
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("N", int(result.nobs))
-    c2.metric("AIC", round(result.aic, 2))
-    c3.metric("Deviance", round(result.deviance, 2))
+    c2.metric("Mean count", round(mean_t, 3))
+    c3.metric("Variance", round(var_t, 3))
+    c4.metric("Var/Mean", round(var_mean_ratio, 3) if np.isfinite(var_mean_ratio) else "NA")
+    c5.metric("AIC", round(result.aic, 2))
 
-    st.markdown("### Coefficients + IRR")
+    c6, c7, c8, c9 = st.columns(4)
+    c6.metric("BIC", round(bic_val, 2) if np.isfinite(bic_val) else "NA")
+    c7.metric("Deviance", round(result.deviance, 2))
+    c8.metric("Pearson χ²/df", round(pearson_disp, 3) if np.isfinite(pearson_disp) else "NA")
+    c9.metric("Deviance/df", round(deviance_disp, 3) if np.isfinite(deviance_disp) else "NA")
+
+    st.markdown("### Coefficients + Incidence Rate Ratios (IRR)")
     tbl = coef_table(result, "Poisson Regression")
     st.dataframe(tbl, use_container_width=True)
     download_buttons(result, tbl, "Poisson Regression")
 
-    # Predictions
-    preds = result.predict(model_df)
+    irr_interp = _poisson_irr_interpretation(tbl)
+    if not irr_interp.empty:
+        with st.expander("Plain-language IRR interpretation", expanded=True):
+            st.dataframe(irr_interp, use_container_width=True)
+
+    preds = np.asarray(result.predict(model_df, offset=offset), dtype=float)
+    preds = np.clip(preds, 1e-12, None)
+
+    if enable_prediction_split:
+        st.markdown("## Poisson Prediction Focus Mode")
+        _poisson_prediction_section(
+            model_df=model_df,
+            target=target,
+            predictors=predictors,
+            formula=formula,
+            full_result=result,
+            test_size=test_size,
+            random_state=split_random_state,
+            plot_template=plot_template,
+            exposure_col=exposure_col,
+        )
+        _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=exposure_col)
+        show_full_poisson_diagnostics = st.checkbox(
+            "Show full Poisson diagnostics in prediction mode",
+            value=False,
+            key="pois_show_full_diagnostics",
+        )
+        if not show_full_poisson_diagnostics:
+            st.info("Full Poisson diagnostics are hidden in prediction mode. Enable the checkbox above to inspect them.")
+            return
+
+    st.markdown("### Model Fit Plot")
     fig = px.scatter(
-        x=model_df[model_target], y=preds,
+        x=model_df[target], y=preds,
         labels={"x": "Actual Count", "y": "Predicted Count"},
         title="Actual vs Predicted Count",
         template=plot_template,
     )
+    max_v = max(float(model_df[target].max()), float(np.max(preds)))
+    fig.add_shape(type="line", x0=0, y0=0, x1=max_v, y1=max_v, line=dict(dash="dash"))
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Diagnostics ──────────────────────────────────────────
-    st.markdown("### 🔬 Diagnostics")
+    st.markdown("### 🔬 Poisson Diagnostics")
     issues = []
 
-    # Pearson dispersion
-    pearson_chi2 = result.pearson_chi2
-    disp_ratio = pearson_chi2 / result.df_resid
-    st.markdown(
-        f"**Pearson χ² / df = `{disp_ratio:.4f}`** "
-        f"(value >> 1 → overdispersion, << 1 → underdispersion)"
-    )
-    if disp_ratio > 1.5:
+    dispersion_df = pd.DataFrame({
+        "Check": ["Variance/Mean", "Pearson χ²/df", "Deviance/df"],
+        "Value": [
+            round(var_mean_ratio, 4) if np.isfinite(var_mean_ratio) else np.nan,
+            round(pearson_disp, 4) if np.isfinite(pearson_disp) else np.nan,
+            round(deviance_disp, 4) if np.isfinite(deviance_disp) else np.nan,
+        ],
+        "Interpretation": [
+            "Poisson expects mean approximately equal to variance.",
+            "Values >1.5 suggest overdispersion; >2 is strong.",
+            "Values >1.5 also suggest overdispersion.",
+        ],
+    })
+    st.dataframe(dispersion_df, use_container_width=True)
+
+    if np.isfinite(pearson_disp) and pearson_disp > 2:
         issues.append({
             "level": "error",
-            "msg": f"Overdispersion detected (Pearson χ²/df = {disp_ratio:.3f})",
-            "fix": "Switch to Negative Binomial Regression. "
-                   "If excess zeros exist, consider Zero-Inflated Poisson (ZIP).",
+            "msg": f"Strong overdispersion detected (Pearson χ²/df = {pearson_disp:.3f}).",
+            "fix": "Use Negative Binomial Regression or another count model that allows overdispersion.",
         })
-
-    # Zero inflation check
-    zero_pct = (model_df[target] == 0).mean() * 100
-    expected_zero_pct = np.exp(-mean_t) * 100
-    st.markdown(
-        f"**Zero inflation check:** Observed zeros = {zero_pct:.1f}%, "
-        f"Expected (Poisson) = {expected_zero_pct:.1f}%"
-    )
-    if zero_pct > expected_zero_pct * 1.5:
+    elif np.isfinite(pearson_disp) and pearson_disp > 1.5:
         issues.append({
             "level": "warning",
-            "msg": f"Excess zeros detected ({zero_pct:.1f}% vs expected {expected_zero_pct:.1f}%)",
-            "fix": "Consider Zero-Inflated Poisson (ZIP) model.",
+            "msg": f"Overdispersion detected (Pearson χ²/df = {pearson_disp:.3f}).",
+            "fix": "Compare with Negative Binomial Regression and consider robust standard errors.",
         })
+    elif np.isfinite(pearson_disp) and pearson_disp > 1.2:
+        issues.append({
+            "level": "info",
+            "msg": f"Mild overdispersion possible (Pearson χ²/df = {pearson_disp:.3f}).",
+            "fix": "Inspect fit and compare AIC with Negative Binomial if needed.",
+        })
+
+    zero_pct = (model_df[target] == 0).mean() * 100
+    expected_zero_pct = np.exp(-mean_t) * 100 if mean_t >= 0 else np.nan
+    zero_ratio = zero_pct / expected_zero_pct if expected_zero_pct and expected_zero_pct > 0 else np.nan
+    zero_df = pd.DataFrame({
+        "Metric": ["Observed zero %", "Expected zero % under Poisson", "Observed / expected zero ratio"],
+        "Value": [
+            round(zero_pct, 2),
+            round(expected_zero_pct, 2) if np.isfinite(expected_zero_pct) else np.nan,
+            round(zero_ratio, 3) if np.isfinite(zero_ratio) else np.nan,
+        ],
+    })
+    st.markdown("#### Zero inflation check")
+    st.dataframe(zero_df, use_container_width=True)
+    if np.isfinite(zero_ratio) and zero_ratio > 1.5:
+        issues.append({
+            "level": "warning",
+            "msg": f"Excess zeros detected ({zero_pct:.1f}% observed vs {expected_zero_pct:.1f}% expected).",
+            "fix": "Consider Zero-Inflated Poisson or Zero-Inflated Negative Binomial if zeros have a separate data-generating process.",
+        })
+
+    pearson_resid = np.asarray(result.resid_pearson)
+    dev_resid = np.asarray(result.resid_deviance)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        fig_pr = px.scatter(
+            x=preds, y=pearson_resid,
+            labels={"x": "Predicted count", "y": "Pearson residual"},
+            title="Pearson Residuals vs Predicted",
+            template=plot_template,
+        )
+        fig_pr.add_hline(y=0, line_dash="dash")
+        st.plotly_chart(fig_pr, use_container_width=True)
+    with col_b:
+        fig_dr = px.scatter(
+            x=preds, y=dev_resid,
+            labels={"x": "Predicted count", "y": "Deviance residual"},
+            title="Deviance Residuals vs Predicted",
+            template=plot_template,
+        )
+        fig_dr.add_hline(y=0, line_dash="dash")
+        st.plotly_chart(fig_dr, use_container_width=True)
+
+    if compare_negative_binomial:
+        st.markdown("### Poisson vs Negative Binomial Comparison")
+        try:
+            nb_result = smf.glm(
+                formula=formula,
+                data=model_df,
+                family=sm.families.NegativeBinomial(),
+                offset=offset,
+            ).fit()
+            nb_bic = getattr(nb_result, "bic_llf", np.nan)
+            if not np.isfinite(nb_bic):
+                try:
+                    nb_bic = nb_result.bic
+                except Exception:
+                    nb_bic = np.nan
+            comp_df = pd.DataFrame({
+                "Metric": ["AIC", "BIC", "Pearson χ²/df"],
+                "Poisson": [
+                    round(result.aic, 2),
+                    round(bic_val, 2) if np.isfinite(bic_val) else np.nan,
+                    round(pearson_disp, 4) if np.isfinite(pearson_disp) else np.nan,
+                ],
+                "Negative Binomial": [
+                    round(nb_result.aic, 2),
+                    round(nb_bic, 2) if np.isfinite(nb_bic) else np.nan,
+                    round(float(nb_result.pearson_chi2 / nb_result.df_resid), 4) if nb_result.df_resid else np.nan,
+                ],
+            })
+            st.dataframe(comp_df, use_container_width=True)
+            if nb_result.aic + 2 < result.aic:
+                st.warning("Negative Binomial has meaningfully lower AIC. It may fit better, especially if overdispersion is present.")
+            else:
+                st.info("Poisson AIC is similar to or lower than Negative Binomial. Poisson may be adequate if diagnostics are acceptable.")
+        except Exception as e:
+            st.info("Negative Binomial comparison could not be completed: " + str(e))
+
+    if not enable_prediction_split:
+        _poisson_predict_on_new_data(model_df, target, predictors, result, exposure_col=exposure_col)
 
     st.markdown("### 🩺 Diagnostic Summary")
     show_diagnostics_header(issues)
@@ -1582,7 +2455,7 @@ def run_negative_binomial(df, target, predictors, plot_template):
 
     preds = result.predict(model_df)
     fig = px.scatter(
-        x=model_df[model_target], y=preds,
+        x=model_df[target], y=preds,
         labels={"x": "Actual Count", "y": "Predicted Count"},
         title="Actual vs Predicted Count",
         template=plot_template,
@@ -1653,6 +2526,7 @@ MODEL_GUIDANCE = {
 def render_base_model_tab(df, df_cleaned, plot_template):
     """Called from app.py inside Tab 5."""
     st.markdown("## Statistical Modeling — Base Models")
+    st.caption("Base Models version: v8_poisson_offset_prediction_nb")
     st.info(
         "Rows with missing values in the selected variables are removed before fitting. "
         "All diagnostics and fix suggestions appear on this page."
@@ -1697,6 +2571,20 @@ def render_base_model_tab(df, df_cleaned, plot_template):
     lr_outcome_transform = "None"
     lr_polynomial_terms = []
     lr_center_polynomial_terms = True
+    lr_interaction_pairs = []
+    lr_compare_reduced_model = False
+    lr_reduced_model_predictors = []
+
+    log_enable_split = False
+    log_test_size = 0.20
+    log_random_state = 42
+    log_threshold = 0.50
+
+    pois_enable_split = False
+    pois_test_size = 0.20
+    pois_random_state = 42
+    pois_exposure_col = None
+    pois_compare_nb = True
 
     if model_type == "Linear Regression":
         with st.expander("Linear Regression options", expanded=True):
@@ -1768,6 +2656,42 @@ def render_base_model_tab(df, df_cleaned, plot_template):
                 help="Uses (x - mean(x))^2 instead of x^2. This usually reduces multicollinearity between x and x^2.",
             )
 
+            st.markdown("#### Interaction terms")
+            st.caption("Use interactions when the effect of one predictor may depend on another predictor, e.g. age × sex.")
+            possible_interactions = []
+            for i, a in enumerate(predictors):
+                for b in predictors[i + 1:]:
+                    possible_interactions.append(f"{a} × {b}")
+            selected_interactions = st.multiselect(
+                "Add interaction term(s)",
+                possible_interactions,
+                default=[],
+                key="lr_interaction_terms",
+                help="Adds interaction-only terms to the OLS formula. Main effects remain in the model.",
+            )
+            lr_interaction_pairs = []
+            for item in selected_interactions:
+                if " × " in item:
+                    a, b = item.split(" × ", 1)
+                    lr_interaction_pairs.append((a, b))
+
+            if not lr_enable_split:
+                st.markdown("#### Nested model comparison / F-test")
+                lr_compare_reduced_model = st.checkbox(
+                    "Compare with a reduced model",
+                    value=False,
+                    key="lr_compare_reduced_model",
+                    help="Fits a smaller model and compares it with the current full model using an F-test plus AIC/BIC.",
+                )
+                if lr_compare_reduced_model:
+                    lr_reduced_model_predictors = st.multiselect(
+                        "Reduced model predictors",
+                        predictors,
+                        default=predictors[:max(1, min(2, len(predictors)))],
+                        key="lr_reduced_model_predictors",
+                        help="Choose the predictors for the smaller model. The current model is treated as the full model.",
+                    )
+
             h1, h2 = st.columns(2)
             lr_show_robust = h1.checkbox(
                 "Show HC3 robust standard errors",
@@ -1780,6 +2704,111 @@ def render_base_model_tab(df, df_cleaned, plot_template):
                 value=True,
                 key="lr_compare_influential",
                 help="Runs sensitivity analysis if Cook's Distance flags influential rows.",
+            )
+
+    if model_type == "Binary Logistic Regression":
+        with st.expander("Logistic Regression options", expanded=True):
+            log_purpose = st.radio(
+                "Analysis purpose",
+                [
+                    "Statistical inference / explanation",
+                    "Prediction / validation",
+                ],
+                horizontal=True,
+                key="log_purpose",
+                help=(
+                    "Inference focuses on odds ratios, p-values, calibration, and model fit. "
+                    "Prediction adds train/test validation, threshold tuning, Brier Score, Log Loss, and new-data prediction."
+                ),
+            )
+            log_enable_split = log_purpose == "Prediction / validation"
+            log_threshold = st.slider(
+                "Classification threshold",
+                min_value=0.05,
+                max_value=0.95,
+                value=0.50,
+                step=0.05,
+                key="log_threshold",
+                help="Probability cutoff for classifying event=1. Lower values usually increase sensitivity; higher values usually increase specificity.",
+            )
+            if log_enable_split:
+                lp1, lp2 = st.columns(2)
+                log_test_size = lp1.slider(
+                    "Test set size",
+                    min_value=0.10,
+                    max_value=0.50,
+                    value=0.20,
+                    step=0.05,
+                    key="log_test_size",
+                )
+                log_random_state = int(lp2.number_input(
+                    "Random seed",
+                    min_value=1,
+                    value=42,
+                    step=1,
+                    key="log_random_state",
+                ))
+
+    if model_type == "Poisson Regression":
+        with st.expander("Poisson Regression options", expanded=True):
+            pois_purpose = st.radio(
+                "Analysis purpose",
+                [
+                    "Statistical inference / explanation",
+                    "Prediction / validation",
+                ],
+                horizontal=True,
+                key="pois_purpose",
+                help=(
+                    "Inference focuses on IRR, overdispersion, zero inflation, and model fit. "
+                    "Prediction adds train/test validation and new-data count prediction."
+                ),
+            )
+            pois_enable_split = pois_purpose == "Prediction / validation"
+
+            if pois_enable_split:
+                pp1, pp2 = st.columns(2)
+                pois_test_size = pp1.slider(
+                    "Test set size",
+                    min_value=0.10,
+                    max_value=0.50,
+                    value=0.20,
+                    step=0.05,
+                    key="pois_test_size",
+                )
+                pois_random_state = int(pp2.number_input(
+                    "Random seed",
+                    min_value=1,
+                    value=42,
+                    step=1,
+                    key="pois_random_state",
+                ))
+
+            st.markdown("#### Rate model / exposure offset")
+            use_exposure = st.checkbox(
+                "Use exposure / offset variable",
+                value=False,
+                key="pois_use_exposure",
+                help="Use this when counts occur over different exposure times, populations, person-years, follow-up days, or days at risk.",
+            )
+            if use_exposure:
+                exposure_candidates = [c for c in available if c not in predictors and pd.api.types.is_numeric_dtype(mdf[c])]
+                if not exposure_candidates:
+                    st.warning("No numeric exposure columns available. Exposure must be numeric and greater than 0.")
+                    pois_exposure_col = None
+                else:
+                    pois_exposure_col = st.selectbox(
+                        "Exposure variable",
+                        exposure_candidates,
+                        key="pois_exposure_col",
+                        help="The model will use offset(log(exposure)). Exposure values must be greater than 0.",
+                    )
+
+            pois_compare_nb = st.checkbox(
+                "Compare with Negative Binomial",
+                value=True,
+                key="pois_compare_nb",
+                help="Useful when overdispersion is present. Compares AIC/BIC and dispersion with a Negative Binomial model.",
             )
 
     if st.button("▶ Run Model", use_container_width=True, key="bm_run"):
@@ -1806,11 +2835,33 @@ def render_base_model_tab(df, df_cleaned, plot_template):
                     outcome_transform=lr_outcome_transform,
                     polynomial_terms=lr_polynomial_terms,
                     center_polynomial_terms=lr_center_polynomial_terms,
+                    interaction_pairs=lr_interaction_pairs,
+                    compare_reduced_model=lr_compare_reduced_model,
+                    reduced_model_predictors=lr_reduced_model_predictors,
                 )
             elif model_type == "Binary Logistic Regression":
-                run_logistic_regression(mdf, target, predictors, plot_template)
+                run_logistic_regression(
+                    mdf,
+                    target,
+                    predictors,
+                    plot_template,
+                    enable_prediction_split=log_enable_split,
+                    test_size=log_test_size,
+                    split_random_state=log_random_state,
+                    classification_threshold=log_threshold,
+                )
             elif model_type == "Poisson Regression":
-                run_poisson_regression(mdf, target, predictors, plot_template)
+                run_poisson_regression(
+                    mdf,
+                    target,
+                    predictors,
+                    plot_template,
+                    enable_prediction_split=pois_enable_split,
+                    test_size=pois_test_size,
+                    split_random_state=pois_random_state,
+                    exposure_col=pois_exposure_col,
+                    compare_negative_binomial=pois_compare_nb,
+                )
             elif model_type == "Negative Binomial Regression":
                 run_negative_binomial(mdf, target, predictors, plot_template)
         except Exception as e:

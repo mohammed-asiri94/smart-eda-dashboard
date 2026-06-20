@@ -82,6 +82,7 @@ from modules.models.survival import render_survival_tab
 from modules.models.time_series import render_time_series_tab
 from modules.models.mixed_effects import render_mixed_effects_tab
 from modules.models.causal import render_causal_tab
+from modules.models.machine_learning import render_machine_learning_tab
 from modules.reports import make_download_csv, generate_html_report
 from modules.statistical_tests import render_statistical_tests
 from modules.data_profiling import render_data_profiling
@@ -1642,6 +1643,7 @@ if uploaded_file is not None:
                 "📅 Time Series + Interrupted Time Series",
                 "🔀 Mixed Effects Models  (LME + GLME)",
                 "⚖️ Causal Inference  (PSM + IPW)",
+                "🤖 Machine Learning  (Classification / Regression / Clustering)",
             ]
 
             # Robust default selection: use a new clean key so old session_state
@@ -1667,6 +1669,8 @@ if uploaded_file is not None:
                 render_mixed_effects_tab(df, df_cleaned, plot_template)
             elif selected_model == MODEL_OPTIONS[4]:
                 render_causal_tab(df, df_cleaned, plot_template)
+            elif selected_model == MODEL_OPTIONS[5]:
+                render_machine_learning_tab(df, df_cleaned, plot_template)
 
         elif active_tab == TAB_OPTIONS[5]:
             st.markdown("## Correlation Analysis")

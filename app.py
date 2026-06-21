@@ -232,47 +232,27 @@ def _first_dataframe_from_dict(result_dict):
     return list(result_dict.values())[0]
 
 
-# ── Common missing-value tokens across real-world datasets ──
-_DEFAULT_NA_VALUES = [
-    "?", "??", "???",
-    "N/A", "n/a", "NA", "na",
-    "None", "none", "NONE",
-    "null", "NULL", "Null",
-    "NaN", "nan", "NAN",
-    "missing", "Missing", "MISSING",
-    "-", "--", "---",
-    ".", " ",
-    "99", "999", "9999",
-    "-99", "-999", "-9999",
-    "-1",
-    "",
-]
-
-
 @st.cache_data
-def load_dataframe(file_bytes, file_name, sheet_name=None, extra_na=None):
+def load_dataframe(file_bytes, file_name, sheet_name=None):
     name = file_name.lower()
-    na_vals = list(_DEFAULT_NA_VALUES)
-    if extra_na:
-        na_vals = list(set(na_vals) | set(extra_na))
 
     # ── Plain text / delimited ──────────────────────────────
     if name.endswith(".csv"):
-        return pd.read_csv(BytesIO(file_bytes), na_values=na_vals, keep_default_na=True)
+        return pd.read_csv(BytesIO(file_bytes))
 
     elif name.endswith(".tsv"):
-        return pd.read_csv(BytesIO(file_bytes), sep="\t", na_values=na_vals, keep_default_na=True)
+        return pd.read_csv(BytesIO(file_bytes), sep="\t")
 
     elif name.endswith(".txt"):
         delim = _detect_delimiter(file_bytes)
-        return pd.read_csv(BytesIO(file_bytes), sep=delim, engine="python", na_values=na_vals, keep_default_na=True)
+        return pd.read_csv(BytesIO(file_bytes), sep=delim, engine="python")
 
     # ── Spreadsheets ─────────────────────────────────────────
     elif name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, na_values=na_vals, keep_default_na=True)
+        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
 
     elif name.endswith(".ods"):
-        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, engine="odf", na_values=na_vals, keep_default_na=True)
+        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, engine="odf")
 
     # ── JSON ─────────────────────────────────────────────────
     elif name.endswith(".json"):
@@ -464,24 +444,6 @@ strong_corr_threshold = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### Missing Value Tokens")
-st.sidebar.caption(
-    "The app already recognises: `?`, `-`, `99`, `999`, `N/A`, `null`, `missing`, etc. "
-    "Add any extra codes used in your dataset (comma-separated)."
-)
-extra_na_raw = st.sidebar.text_input(
-    "Extra missing-value codes",
-    value="",
-    placeholder='e.g.  "Unknown", 88, -9',
-    key="extra_na_input",
-)
-extra_na_tokens = (
-    tuple(v.strip().strip('"').strip("'") for v in extra_na_raw.split(",") if v.strip())
-    if extra_na_raw.strip()
-    else None
-)
-
-st.sidebar.markdown("---")
 st.sidebar.markdown("### What this app does")
 st.sidebar.markdown(
     """
@@ -525,8 +487,7 @@ if uploaded_file is not None:
             selected_sheet = st.sidebar.selectbox("Choose Excel sheet", sheet_names)
 
         df = load_dataframe(
-            uploaded_file.getvalue(), uploaded_file.name.lower(), selected_sheet,
-            extra_na=extra_na_tokens,
+            uploaded_file.getvalue(), uploaded_file.name.lower(), selected_sheet
         )
 
         numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
@@ -1034,6 +995,128 @@ if uploaded_file is not None:
                         )
                     else:
                         st.warning("No usable numeric columns for multiple imputation.")
+
+            # ── Advanced Row Filtering ─────────────────────────────
+            st.markdown("---")
+            st.markdown("### Advanced Row Filtering")
+            st.caption(
+                "Use this section to remove specific rows after cleaning — "
+                "e.g. influential observations identified by Cook's Distance, "
+                "impossible values, or rows matching a condition."
+            )
+
+            _dc = st.session_state["df_cleaned"] if st.session_state["df_cleaned"] is not None else df.copy()
+
+            filter_method = st.radio(
+                "Filter method",
+                [
+                    "Remove rows by index",
+                    "Remove rows by condition",
+                    "Remove rows with missing values",
+                ],
+                horizontal=True,
+                key="adv_filter_method",
+            )
+
+            if filter_method == "Remove rows by index":
+                st.caption(
+                    "Enter the row index numbers to remove (comma-separated). "
+                    "You can find these in the Cook's Distance table under Models → Linear Regression → Diagnostics."
+                )
+                idx_input = st.text_input(
+                    "Row indices to remove",
+                    placeholder="e.g. 3813, 2790, 2787",
+                    key="adv_idx_input",
+                )
+                if idx_input.strip():
+                    try:
+                        indices_to_remove = [int(x.strip()) for x in idx_input.split(",") if x.strip()]
+                        valid = [i for i in indices_to_remove if i in _dc.index]
+                        invalid = [i for i in indices_to_remove if i not in _dc.index]
+                        st.info(
+                            f"Will remove **{len(valid)}** row(s): {valid}"
+                            + (f"  |  Not found: {invalid}" if invalid else "")
+                        )
+                        if valid and st.button("▶ Remove these rows", key="adv_idx_apply", use_container_width=True):
+                            _dc = _dc.drop(index=valid, errors="ignore")
+                            st.session_state["df_cleaned"] = _dc
+                            st.session_state["cleaning_applied"] = True
+                            st.success(f"✅ Removed {len(valid)} row(s). Dataset now has {len(_dc):,} rows.")
+                            st.rerun()
+                    except ValueError:
+                        st.error("Invalid input — please enter numbers only, separated by commas.")
+
+            elif filter_method == "Remove rows by condition":
+                st.caption("Remove rows where a column satisfies a condition — e.g. impossible values or extreme outliers.")
+                _num_cols_dc = _dc.select_dtypes(include=np.number).columns.tolist()
+                _all_cols_dc = _dc.columns.tolist()
+
+                cond_col1, cond_col2, cond_col3 = st.columns(3)
+                cond_col = cond_col1.selectbox("Column", _all_cols_dc, key="adv_cond_col")
+                cond_op = cond_col2.selectbox(
+                    "Condition",
+                    ["==", "!=", ">", ">=", "<", "<=", "contains", "is missing"],
+                    key="adv_cond_op",
+                )
+                cond_val = cond_col3.text_input("Value", placeholder="e.g. 100 or MD", key="adv_cond_val")
+
+                if st.button("Preview rows to remove", key="adv_cond_preview", use_container_width=True):
+                    try:
+                        col_series = _dc[cond_col]
+                        if cond_op == "is missing":
+                            mask = col_series.isna()
+                        elif cond_op == "contains":
+                            mask = col_series.astype(str).str.contains(cond_val, na=False)
+                        else:
+                            if cond_col in _num_cols_dc:
+                                val = float(cond_val)
+                                ops = {"==": col_series == val, "!=": col_series != val,
+                                       ">": col_series > val, ">=": col_series >= val,
+                                       "<": col_series < val, "<=": col_series <= val}
+                            else:
+                                ops = {"==": col_series.astype(str) == cond_val,
+                                       "!=": col_series.astype(str) != cond_val,
+                                       ">": col_series.astype(str) > cond_val,
+                                       ">=": col_series.astype(str) >= cond_val,
+                                       "<": col_series.astype(str) < cond_val,
+                                       "<=": col_series.astype(str) <= cond_val}
+                            mask = ops[cond_op]
+                        n_match = int(mask.sum())
+                        st.info(f"**{n_match}** row(s) match this condition.")
+                        if n_match > 0:
+                            st.dataframe(_dc[mask].head(20), use_container_width=True)
+                            st.session_state["adv_cond_mask"] = mask
+                    except Exception as e:
+                        st.error("Could not apply condition: " + str(e))
+
+                if st.session_state.get("adv_cond_mask") is not None:
+                    if st.button("▶ Remove matching rows", key="adv_cond_apply", use_container_width=True):
+                        mask = st.session_state["adv_cond_mask"]
+                        _dc = _dc[~mask].copy()
+                        st.session_state["df_cleaned"] = _dc
+                        st.session_state["cleaning_applied"] = True
+                        st.session_state["adv_cond_mask"] = None
+                        st.success(f"✅ Rows removed. Dataset now has {len(_dc):,} rows.")
+                        st.rerun()
+
+            elif filter_method == "Remove rows with missing values":
+                st.caption("Remove any row that has at least one missing value in the selected columns.")
+                _all_cols_dc = _dc.columns.tolist()
+                miss_cols = st.multiselect(
+                    "Apply to columns (leave empty = all columns)",
+                    _all_cols_dc,
+                    default=[],
+                    key="adv_miss_cols",
+                )
+                check_cols = miss_cols if miss_cols else _all_cols_dc
+                n_missing_rows = int(_dc[check_cols].isnull().any(axis=1).sum())
+                st.info(f"**{n_missing_rows}** row(s) have at least one missing value in the selected columns.")
+                if n_missing_rows > 0 and st.button("▶ Remove rows with missing values", key="adv_miss_apply", use_container_width=True):
+                    _dc = _dc.dropna(subset=check_cols).copy()
+                    st.session_state["df_cleaned"] = _dc
+                    st.session_state["cleaning_applied"] = True
+                    st.success(f"✅ Removed {n_missing_rows} row(s). Dataset now has {len(_dc):,} rows.")
+                    st.rerun()
 
         # ════════════════════════════════════════════════════
         # Tab 4 — Visual Analysis

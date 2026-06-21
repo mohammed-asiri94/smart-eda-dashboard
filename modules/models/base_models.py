@@ -282,11 +282,19 @@ def _plot_linear_diagnostics(result, residuals, fitted, plot_template):
         "These plots check linearity, normality, equal variance, leverage, and influential observations."
     )
 
-    influence = OLSInfluence(result)
-    std_resid = np.asarray(influence.resid_studentized_internal)
-    leverage = np.asarray(influence.hat_matrix_diag)
-    cooks_d = np.asarray(influence.cooks_distance[0])
     n = len(residuals)
+    X_mat = result.model.exog
+    sigma2 = float(result.mse_resid) if result.mse_resid > 0 else 1e-12
+    try:
+        q_mat, _ = np.linalg.qr(X_mat)
+        leverage = np.sum(q_mat ** 2, axis=1)
+    except Exception:
+        leverage = np.full(n, result.df_model / max(n, 1))
+    leverage = np.clip(leverage, 0, 1 - 1e-9)
+    std_resid = residuals / (np.sqrt(sigma2) * np.sqrt(np.maximum(1 - leverage, 1e-12)))
+    p = X_mat.shape[1]
+    denom = np.maximum(p * sigma2 * (1 - leverage) ** 2, 1e-12)
+    cooks_d = (residuals ** 2 * leverage) / denom
     cooks_threshold = 4 / max(n, 1)
 
     col_a, col_b = st.columns(2)
@@ -298,7 +306,13 @@ def _plot_linear_diagnostics(result, residuals, fitted, plot_template):
             marker=dict(size=5, opacity=0.60), name="Residuals",
         ))
         try:
-            lowess = sm.nonparametric.lowess(residuals, fitted, frac=max(0.25, min(0.8, 30 / max(n, 1))))
+            _LOWESS_MAX = 3000
+            if n > _LOWESS_MAX:
+                _lidx = np.random.default_rng(42).choice(n, _LOWESS_MAX, replace=False)
+                _lr, _lf = residuals[_lidx], fitted[_lidx]
+            else:
+                _lr, _lf = residuals, fitted
+            lowess = sm.nonparametric.lowess(_lr, _lf, frac=max(0.25, min(0.8, 30 / max(len(_lr), 1))))
             fig1.add_trace(go.Scatter(
                 x=lowess[:, 0], y=lowess[:, 1], mode="lines", name="LOWESS trend",
             ))
@@ -339,7 +353,13 @@ def _plot_linear_diagnostics(result, residuals, fitted, plot_template):
             marker=dict(size=5, opacity=0.60), name="sqrt(|standardized residuals|)",
         ))
         try:
-            lowess3 = sm.nonparametric.lowess(sqrt_std_resid, fitted, frac=max(0.25, min(0.8, 30 / max(n, 1))))
+            _LOWESS_MAX = 3000
+            if n > _LOWESS_MAX:
+                _lidx2 = np.random.default_rng(43).choice(n, _LOWESS_MAX, replace=False)
+                _ls, _lf2 = sqrt_std_resid[_lidx2], fitted[_lidx2]
+            else:
+                _ls, _lf2 = sqrt_std_resid, fitted
+            lowess3 = sm.nonparametric.lowess(_ls, _lf2, frac=max(0.25, min(0.8, 30 / max(len(_ls), 1))))
             fig3.add_trace(go.Scatter(x=lowess3[:, 0], y=lowess3[:, 1], mode="lines", name="LOWESS trend"))
         except Exception:
             pass
@@ -798,8 +818,13 @@ def _quick_prediction_health_check(result, model_df, train_r2=None, test_r2=None
 
     # Influential observations: a few points can dominate a linear prediction model.
     try:
-        influence = OLSInfluence(result)
-        cooks_d = np.asarray(influence.cooks_distance[0])
+        X_mat = result.model.exog
+        resid_arr = np.asarray(result.resid)
+        sigma2_q = float(result.mse_resid) if result.mse_resid > 0 else 1e-12
+        p_q = X_mat.shape[1]
+        q_mat_q, _ = np.linalg.qr(X_mat)
+        lev_q = np.clip(np.sum(q_mat_q ** 2, axis=1), 0, 1 - 1e-9)
+        cooks_d = (resid_arr ** 2 * lev_q) / np.maximum(p_q * sigma2_q * (1 - lev_q) ** 2, 1e-12)
         threshold = 4 / max(len(model_df), 1)
         n_influential = int((cooks_d > threshold).sum())
         if n_influential > 0:
@@ -1012,16 +1037,32 @@ def run_linear_regression(
     issues = []
     checklist = []
 
-    influence = OLSInfluence(result)
-    cooks_d = np.asarray(influence.cooks_distance[0])
-    leverage = np.asarray(influence.hat_matrix_diag)
-    std_resid_int = np.asarray(influence.resid_studentized_internal)
-    try:
-        std_resid_ext = np.asarray(influence.resid_studentized_external)
-    except Exception:
-        std_resid_ext = std_resid_int
     n = len(model_df)
     p_model = int(result.df_model) + 1
+    X_mat = result.model.exog
+    resid_arr = np.asarray(result.resid)
+    sigma2 = float(result.mse_resid) if result.mse_resid > 0 else 1e-12
+    try:
+        q_mat, _ = np.linalg.qr(X_mat)
+        leverage = np.sum(q_mat ** 2, axis=1)
+    except Exception:
+        leverage = np.full(n, p_model / max(n, 1))
+    leverage = np.clip(leverage, 0, 1 - 1e-9)
+    std_resid_int = resid_arr / (np.sqrt(sigma2) * np.sqrt(np.maximum(1 - leverage, 1e-12)))
+    try:
+        df_resid = float(result.df_resid)
+        std_resid_ext = std_resid_int * np.sqrt(
+            (df_resid - 1) / np.maximum(df_resid - std_resid_int ** 2, 1e-12)
+        )
+    except Exception:
+        std_resid_ext = std_resid_int
+    denom = np.maximum(p_model * sigma2 * (1 - leverage) ** 2, 1e-12)
+    cooks_d = (resid_arr ** 2 * leverage) / denom
+    _idx = model_df.index
+    cooks_d       = pd.Series(cooks_d,       index=_idx)
+    leverage      = pd.Series(leverage,      index=_idx)
+    std_resid_int = pd.Series(std_resid_int, index=_idx)
+    std_resid_ext = pd.Series(std_resid_ext, index=_idx)
 
     _plot_linear_diagnostics(result, np.asarray(residuals), np.asarray(preds), plot_template)
 
@@ -1281,9 +1322,20 @@ def run_linear_regression(
     except Exception as e:
         checklist.append(_make_diagnostic_row("Outliers", "Studentized residuals", "Failed: " + str(e), "Not assessed", "Check residuals."))
 
-    # DFBETAS
+    # DFBETAS via QR
     try:
-        dfbetas = np.asarray(influence.dfbetas)
+        _X = X_mat
+        _e = resid_arr
+        _h = np.asarray(leverage)
+        _s = np.sqrt(sigma2)
+        try:
+            _XtXinv = np.linalg.pinv(_X.T @ _X)
+            _denom_dfb = np.maximum(_s * (1 - _h), 1e-12)
+            dfbetas = np.zeros((_X.shape[0], _X.shape[1]))
+            for i in range(_X.shape[0]):
+                dfbetas[i] = (_XtXinv @ _X[i]) * _e[i] / _denom_dfb[i]
+        except Exception:
+            dfbetas = np.zeros((_X.shape[0], _X.shape[1]))
         dfbeta_threshold = 2 / np.sqrt(max(n, 1))
         dfbeta_mask = np.abs(dfbetas) > dfbeta_threshold
         n_dfbeta_cells = int(dfbeta_mask.sum())
@@ -1323,7 +1375,8 @@ def run_linear_regression(
     if compare_without_influential and n_influential > 0 and n - n_influential > p_model + 2:
         st.markdown("### Sensitivity Analysis: Refit Without Influential Observations")
         try:
-            refit_df = model_df.loc[~influential_mask].copy()
+            _keep_mask = ~np.asarray(influential_mask, dtype=bool)
+            refit_df = model_df.iloc[_keep_mask].copy().reset_index(drop=True)
             refit_result = smf.ols(formula=formula, data=refit_df).fit()
             compare_metrics = pd.DataFrame({
                 "Metric": ["N", "R2", "Adjusted R2", "AIC", "BIC"],

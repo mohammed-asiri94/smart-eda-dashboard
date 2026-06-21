@@ -232,27 +232,47 @@ def _first_dataframe_from_dict(result_dict):
     return list(result_dict.values())[0]
 
 
+# ── Common missing-value tokens across real-world datasets ──
+_DEFAULT_NA_VALUES = [
+    "?", "??", "???",
+    "N/A", "n/a", "NA", "na",
+    "None", "none", "NONE",
+    "null", "NULL", "Null",
+    "NaN", "nan", "NAN",
+    "missing", "Missing", "MISSING",
+    "-", "--", "---",
+    ".", " ",
+    "99", "999", "9999",
+    "-99", "-999", "-9999",
+    "-1",
+    "",
+]
+
+
 @st.cache_data
-def load_dataframe(file_bytes, file_name, sheet_name=None):
+def load_dataframe(file_bytes, file_name, sheet_name=None, extra_na=None):
     name = file_name.lower()
+    na_vals = list(_DEFAULT_NA_VALUES)
+    if extra_na:
+        na_vals = list(set(na_vals) | set(extra_na))
 
     # ── Plain text / delimited ──────────────────────────────
     if name.endswith(".csv"):
-        return pd.read_csv(BytesIO(file_bytes))
+        return pd.read_csv(BytesIO(file_bytes), na_values=na_vals, keep_default_na=True)
 
     elif name.endswith(".tsv"):
-        return pd.read_csv(BytesIO(file_bytes), sep="\t")
+        return pd.read_csv(BytesIO(file_bytes), sep="\t", na_values=na_vals, keep_default_na=True)
 
     elif name.endswith(".txt"):
         delim = _detect_delimiter(file_bytes)
-        return pd.read_csv(BytesIO(file_bytes), sep=delim, engine="python")
+        return pd.read_csv(BytesIO(file_bytes), sep=delim, engine="python", na_values=na_vals, keep_default_na=True)
 
     # ── Spreadsheets ─────────────────────────────────────────
     elif name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
+        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, na_values=na_vals, keep_default_na=True)
 
     elif name.endswith(".ods"):
-        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, engine="odf")
+        return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, engine="odf", na_values=na_vals, keep_default_na=True)
 
     # ── JSON ─────────────────────────────────────────────────
     elif name.endswith(".json"):
@@ -444,6 +464,24 @@ strong_corr_threshold = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.markdown("### Missing Value Tokens")
+st.sidebar.caption(
+    "The app already recognises: `?`, `-`, `99`, `999`, `N/A`, `null`, `missing`, etc. "
+    "Add any extra codes used in your dataset (comma-separated)."
+)
+extra_na_raw = st.sidebar.text_input(
+    "Extra missing-value codes",
+    value="",
+    placeholder='e.g.  "Unknown", 88, -9',
+    key="extra_na_input",
+)
+extra_na_tokens = (
+    tuple(v.strip().strip('"').strip("'") for v in extra_na_raw.split(",") if v.strip())
+    if extra_na_raw.strip()
+    else None
+)
+
+st.sidebar.markdown("---")
 st.sidebar.markdown("### What this app does")
 st.sidebar.markdown(
     """
@@ -487,7 +525,8 @@ if uploaded_file is not None:
             selected_sheet = st.sidebar.selectbox("Choose Excel sheet", sheet_names)
 
         df = load_dataframe(
-            uploaded_file.getvalue(), uploaded_file.name.lower(), selected_sheet
+            uploaded_file.getvalue(), uploaded_file.name.lower(), selected_sheet,
+            extra_na=extra_na_tokens,
         )
 
         numeric_cols = df.select_dtypes(include=np.number).columns.tolist()

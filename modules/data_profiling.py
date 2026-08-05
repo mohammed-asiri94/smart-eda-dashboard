@@ -276,6 +276,7 @@ def _profile_categorical(series, col_name, plot_template):
 # Summary profiling table (all columns)
 # ============================================================
 
+@st.cache_data(show_spinner=False)
 def _build_summary_table(df):
     """Build a summary table for all columns."""
     rows = []

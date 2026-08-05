@@ -23,6 +23,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.stats.outliers_influence import OLSInfluence
 import statsmodels.api as sm
 import pmdarima as pm
+from modules.models.data_audit import prepare_complete_cases, render_model_data_audit
 
 
 # ============================================================
@@ -1929,7 +1930,7 @@ def render_time_series_tab(df, df_cleaned, plot_template):
         key="ts_dataset",
     )
 
-    mdf = df_cleaned.copy() if dataset_choice.startswith("Cleaned") else df.copy()
+    mdf = df_cleaned if dataset_choice.startswith("Cleaned") else df
 
     all_cols = mdf.columns.tolist()
     numeric_cols = mdf.select_dtypes(include=np.number).columns.tolist()
@@ -2148,7 +2149,12 @@ def render_time_series_tab(df, df_cleaned, plot_template):
 **Controlled ITS** uses a parallel control series to remove common trends.
             """)
 
-    ts_df = mdf[[time_col, value_col]].dropna().copy()
+    ts_df, time_series_audit = prepare_complete_cases(
+        mdf,
+        [time_col, value_col],
+        "Rows missing the selected time or value variable are excluded.",
+    )
+    render_model_data_audit(time_series_audit, title="Time-series data audit")
 
     if ts_df.empty:
         st.warning("No usable rows after removing missing values from the selected time/value columns.")

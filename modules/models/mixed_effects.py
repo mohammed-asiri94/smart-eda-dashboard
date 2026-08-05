@@ -37,6 +37,7 @@ import statsmodels.formula.api as smf
 import statsmodels.api as sm
 from statsmodels.genmod.generalized_estimating_equations import GEE
 from statsmodels.genmod.cov_struct import Exchangeable, Independence
+from modules.models.data_audit import prepare_complete_cases, render_model_data_audit
 
 
 # ============================================================
@@ -186,7 +187,8 @@ def run_lme(df, outcome, fixed_effects, group_col, random_slopes, plot_template)
 
     # ── Prepare data ──────────────────────────────────────────
     cols = list(dict.fromkeys([outcome, group_col] + fixed_effects))
-    data = df[cols].dropna().copy()
+    data, data_audit = prepare_complete_cases(df, cols)
+    render_model_data_audit(data_audit)
 
     if data.empty:
         st.error("No data remaining after dropping missing values.")
@@ -633,7 +635,8 @@ def run_glme(df, outcome, fixed_effects, group_col, family_name, plot_template):
     issues = []
 
     cols = list(dict.fromkeys([outcome, group_col] + fixed_effects))
-    data = df[cols].dropna().copy()
+    data, data_audit = prepare_complete_cases(df, cols)
+    render_model_data_audit(data_audit)
 
     if data.empty:
         st.error("No data remaining after dropping missing values.")
@@ -914,7 +917,7 @@ def render_mixed_effects_tab(df, df_cleaned, plot_template):
         horizontal=True,
         key="me_dataset",
     )
-    mdf = df_cleaned.copy() if dataset_choice.startswith("Cleaned") else df.copy()
+    mdf = df_cleaned if dataset_choice.startswith("Cleaned") else df
 
     all_cols     = mdf.columns.tolist()
     numeric_cols = mdf.select_dtypes(include=np.number).columns.tolist()

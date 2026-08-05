@@ -37,6 +37,11 @@ from sklearn.metrics import (
 )
 from scipy import stats
 from sklearn.model_selection import train_test_split
+from modules.models.data_audit import (
+    prepare_complete_cases,
+    render_model_data_audit,
+    render_train_test_audit,
+)
 
 
 # ============================================================
@@ -141,7 +146,8 @@ def add_polynomial_features(model_df, polynomial_terms=None, center=True):
 
 def prepare_data(df, target, predictors):
     cols = [target] + predictors
-    return df[cols].dropna().copy()
+    model_df, _ = prepare_complete_cases(df, cols)
+    return model_df
 
 
 def coef_table(result, model_type):
@@ -548,6 +554,7 @@ def _prediction_split_section(
             test_size=float(test_size),
             random_state=int(random_state),
         )
+        render_train_test_audit(len(model_df), len(train_df), len(test_df))
         train_result = smf.ols(formula=formula, data=train_df).fit()
 
         train_pred_model_scale = train_result.predict(train_df)
@@ -875,6 +882,7 @@ def run_linear_regression(
     interaction_pairs = interaction_pairs or []
     reduced_model_predictors = reduced_model_predictors or []
     model_df = prepare_data(df, target, predictors)
+    render_model_data_audit(model_df.attrs["model_data_audit"])
     if model_df.empty:
         st.error("No data remaining after dropping missing values.")
         return
@@ -2200,6 +2208,7 @@ def _logistic_prediction_workflow(model_df, target, predictors, formula, full_re
             random_state=int(random_state),
             stratify=model_df[target] if model_df[target].nunique() == 2 else None,
         )
+        render_train_test_audit(len(model_df), len(train_df), len(test_df))
         train_result = smf.logit(formula=formula, data=train_df).fit(disp=False)
         train_probs = np.asarray(train_result.predict(train_df), dtype=float)
         test_probs = np.asarray(train_result.predict(test_df), dtype=float)
@@ -2277,6 +2286,7 @@ def run_logistic_regression(
     predictor_transform_map=None,
 ):
     model_df = prepare_data(df, target, predictors)
+    render_model_data_audit(model_df.attrs["model_data_audit"])
     if model_df.empty:
         st.error("No data remaining after dropping missing values.")
         return
@@ -2667,6 +2677,7 @@ def _poisson_prediction_section(model_df, target, predictors, formula, full_resu
         return
     try:
         train_df, test_df = train_test_split(model_df, test_size=float(test_size), random_state=int(random_state))
+        render_train_test_audit(len(model_df), len(train_df), len(test_df))
         train_offset = np.log(train_df[exposure_col].astype(float)) if exposure_col else None
         test_offset = np.log(test_df[exposure_col].astype(float)) if exposure_col else None
         train_result = smf.glm(
@@ -2751,7 +2762,8 @@ def run_poisson_regression(
     predictor_transform_map=None,
 ):
     cols = [target] + predictors + ([exposure_col] if exposure_col else [])
-    model_df = df[cols].dropna().copy()
+    model_df, poisson_audit = prepare_complete_cases(df, cols)
+    render_model_data_audit(poisson_audit)
     if model_df.empty:
         st.error("No data remaining after dropping missing values.")
         return
@@ -3023,6 +3035,7 @@ def run_poisson_regression(
 
 def run_negative_binomial(df, target, predictors, plot_template):
     model_df = prepare_data(df, target, predictors)
+    render_model_data_audit(model_df.attrs["model_data_audit"])
     if model_df.empty:
         st.error("No data remaining after dropping missing values.")
         return
@@ -3137,7 +3150,7 @@ def render_base_model_tab(df, df_cleaned, plot_template):
         ["Original data", "Cleaned data (from Data Cleaning tab)"],
         horizontal=True,
     )
-    mdf = df_cleaned.copy() if dataset_choice.startswith("Cleaned") else df.copy()
+    mdf = df_cleaned if dataset_choice.startswith("Cleaned") else df
 
     all_cols = mdf.columns.tolist()
     if len(all_cols) < 2:

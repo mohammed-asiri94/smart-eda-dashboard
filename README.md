@@ -46,6 +46,17 @@ The project is still an initial version and is being continuously improved. Futu
 * Run statistical tests
 * Generate downloadable reports
 * Export reports as CSV, HTML, and Excel files
+* Normalize uploaded tabular formats to temporary Parquet storage
+* Use exact DuckDB queries for core metrics in Large Data Mode (100,000+ rows)
+* Run expensive quality checks, outlier detection, summaries, and profiling only when requested
+* Reuse completed analysis results across Streamlit reruns until the dataset or relevant settings change
+* Calculate histogram, ECDF, density, categorical, and time-bucket aggregates from all rows
+* Limit browser-heavy point charts to a deterministic, disclosed display-only sample
+* Keep multivariate point charts to 5,000 displayed observations without sampling model inputs
+* Show a row-accounting audit for every model family, including source, eligible, excluded, training, and test rows
+* Never apply display sampling to statistical or machine-learning model inputs
+* Start machine-learning training only after an explicit Run action
+* Stop models by default when any row would be excluded; temporary model-only exclusion requires explicit user permission
 
 ## Visualization Features
 
@@ -169,6 +180,8 @@ The app allows users to download different outputs, including:
 * SciPy
 * openpyxl
 * xlrd
+* pyarrow
+* DuckDB
 
 ## Project Structure
 
@@ -181,6 +194,28 @@ smart-eda-dashboard/
 ├── run_app.bat
 ├── .gitignore
 ├── .streamlit/
+├── services/
+│   ├── __init__.py
+│   ├── error_service.py
+│   ├── dataset_service.py
+│   ├── file_service.py
+│   ├── quality_service.py
+│   ├── session_service.py
+│   ├── upload_controller.py
+│   └── visual_service.py
+│
+├── ui/
+│   ├── __init__.py
+│   ├── cleaning_page.py
+│   ├── correlation_page.py
+│   ├── layout.py
+│   ├── model_page.py
+│   ├── overview_page.py
+│   ├── quality_page.py
+│   ├── raw_data_page.py
+│   ├── reports_page.py
+│   ├── sidebar.py
+│   └── visual_page.py
 │
 └── modules/
     ├── __init__.py
@@ -189,6 +224,7 @@ smart-eda-dashboard/
     ├── reports.py
     ├── statistical_tests.py
     ├── data_profiling.py
+    ├── large_data_engine.py
     │
     └── models/
         ├── __init__.py
@@ -196,10 +232,28 @@ smart-eda-dashboard/
         ├── survival.py
         ├── time_series.py
         ├── mixed_effects.py
+        ├── data_audit.py
         └── causal.py
 ```
 
+## Automated Tests
+
+Run the permanent regression suite from the project directory:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The suite verifies file validation and session invalidation, Parquet-backed
+ingestion, preservation of all 500,000 rows, absence of model sampling, and
+the requirement for an explicit user action before cleaning.
+
 ## How to Run Locally
+
+Install Python 3.11 or 3.12 and enable **Add Python to PATH** during setup.
+On Windows, `run_app.bat` now detects either `python` or the `py -3` launcher,
+installs missing project dependencies, and starts Streamlit. If Python itself
+is missing, it displays installation instructions instead of closing silently.
 
 Clone the repository:
 
@@ -236,6 +290,10 @@ streamlit run app.py
 * The app is designed for exploratory and educational analysis.
 * Results should be interpreted carefully, especially statistical models and causal inference outputs.
 * Users should avoid uploading sensitive or confidential data to the public web version.
+* Pickle files (`.pkl` and `.pickle`) are intentionally unsupported because loading them can execute untrusted code.
+* Uploaded files are validated before parsing. The public app currently enforces a 100 MB upload safety limit.
+* Files with 100,000 rows or more use disk-backed Parquet storage. Core metrics and models continue to use all eligible rows; any future visual sampling must be disclosed separately.
+* Temporary normalized datasets are removed after their retention window and are not written into the project repository.
 * The project is still under active development and may continue to change as new features and improvements are added.
 
 ## Future Improvements

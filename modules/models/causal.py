@@ -26,6 +26,7 @@ from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial.distance import mahalanobis
 from scipy.linalg import inv
+from modules.models.data_audit import prepare_complete_cases, render_model_data_audit
 
 
 # ============================================================
@@ -2086,7 +2087,13 @@ def render_causal_tab(df, df_cleaned, plot_template):
             st.info("Treatment encoded: " + str(sorted_t[0]) + "->0, " + str(sorted_t[1]) + "->1")
 
         key_cols = list(set([treatment_col, outcome_col] + covariate_cols))
-        data_clean = mdf[key_cols].dropna().copy().reset_index(drop=True)
+        data_clean, causal_audit = prepare_complete_cases(
+            mdf,
+            key_cols,
+            "Rows missing treatment, outcome, or any selected covariate are excluded before matching or weighting.",
+        )
+        render_model_data_audit(causal_audit, title="Causal-analysis data audit")
+        data_clean = data_clean.reset_index(drop=True)
 
         if len(data_clean) < 20:
             st.error("Too few complete observations (" + str(len(data_clean)) + "). Need at least 20.")

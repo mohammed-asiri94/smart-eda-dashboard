@@ -13,6 +13,11 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.figure_factory as ff
+from modules.models.data_audit import (
+    build_model_data_audit,
+    render_model_data_audit,
+    render_train_test_audit,
+)
 
 from sklearn.model_selection import (
     train_test_split,
@@ -75,7 +80,7 @@ from sklearn.inspection import permutation_importance
 # Generic helpers
 # ============================================================
 def _get_working_df(df, df_cleaned):
-    return df_cleaned.copy() if df_cleaned is not None else df.copy()
+    return df_cleaned if df_cleaned is not None else df
 
 
 def _make_ohe():
@@ -127,6 +132,13 @@ def _prepare_xy(data, target_col, predictor_cols):
     cols = predictor_cols + [target_col]
     model_df = data[cols].copy()
     model_df = model_df.dropna(subset=[target_col])
+    audit = build_model_data_audit(
+        data,
+        model_df,
+        cols,
+        "Rows with a missing target are excluded; predictor missingness is handled inside the training Pipeline.",
+    )
+    model_df.attrs["model_data_audit"] = audit.to_dict()
     X = model_df[predictor_cols]
     y = model_df[target_col]
     return model_df, X, y
@@ -579,6 +591,7 @@ def _render_classification(data, target_col, predictor_cols, plot_template):
         )
 
     model_df, X, y = _prepare_xy(data, target_col, predictor_cols)
+    render_model_data_audit(model_df.attrs["model_data_audit"])
 
     if y.nunique() < 2:
         st.error("The target must have at least two classes.")
@@ -672,6 +685,7 @@ def _render_classification(data, target_col, predictor_cols, plot_template):
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state, stratify=stratify
         )
+        render_train_test_audit(len(model_df), len(X_train), len(X_test))
     except Exception as e:
         st.error("Could not split the data. Try disabling stratification or using a larger dataset.")
         st.code(str(e))
@@ -918,6 +932,7 @@ def _render_regression(data, target_col, predictor_cols, plot_template):
         )
 
     model_df, X, y = _prepare_xy(data, target_col, predictor_cols)
+    render_model_data_audit(model_df.attrs["model_data_audit"])
     y = pd.to_numeric(y, errors="coerce")
     keep = y.notna()
     X = X.loc[keep]
@@ -1000,6 +1015,7 @@ def _render_regression(data, target_col, predictor_cols, plot_template):
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state
         )
+        render_train_test_audit(len(model_df), len(X_train), len(X_test))
     except Exception as e:
         st.error("Could not split the data.")
         st.code(str(e))
@@ -1394,6 +1410,13 @@ def _render_clustering(data, predictor_cols, plot_template):
 
     X = data[predictor_cols].copy()
     X = X.dropna(how="all")
+    clustering_audit = build_model_data_audit(
+        data,
+        X,
+        predictor_cols,
+        "Rows missing every selected predictor are excluded; remaining predictor missingness is imputed inside the Pipeline.",
+    )
+    render_model_data_audit(clustering_audit)
 
     categorical_encoding, scale_numeric, text_features, tfidf_max_features = _preprocessing_options(
         data=data.loc[X.index],
@@ -1553,7 +1576,7 @@ def render_machine_learning_tab(df, df_cleaned=None, plot_template="plotly_white
         horizontal=True,
         key="ml_data_source",
     )
-    data = _get_working_df(df, df_cleaned) if data_source == "Cleaned data" else df.copy()
+    data = _get_working_df(df, df_cleaned) if data_source == "Cleaned data" else df
 
     if data is None or data.empty:
         st.warning("Upload a dataset first.")
@@ -1596,6 +1619,18 @@ def render_machine_learning_tab(df, df_cleaned=None, plot_template="plotly_white
         return
 
     st.markdown("---")
+    st.caption(
+        f"The selected workflow will receive all {len(data):,} source rows. "
+        "Eligibility, Train/Test allocation, and exclusions are reported below."
+    )
+    if not st.button(
+        "▶ Run Machine Learning Workflow",
+        use_container_width=True,
+        type="primary",
+        key="ml_run_workflow",
+    ):
+        st.info("Configure X, Y, and the task, then run the workflow explicitly.")
+        return
 
     try:
         if task_type == "Classification":

@@ -26,6 +26,7 @@ from lifelines import (
 )
 from lifelines.statistics import logrank_test, multivariate_logrank_test, proportional_hazard_test
 from lifelines.utils import concordance_index
+from modules.models.data_audit import build_model_data_audit, render_model_data_audit
 
 
 # ============================================================
@@ -322,6 +323,13 @@ def run_kaplan_meier(df, duration_col, event_col, group_col, plot_template, show
         _show_issue(issue.get("level", "warning"), issue.get("msg", ""), issue.get("fix", ""))
 
     data = _prep_survival_data(df, duration_col, event_col, [group_col] if group_col else [])
+    km_audit = build_model_data_audit(
+        df,
+        data,
+        [duration_col, event_col] + ([group_col] if group_col else []),
+        "Rows with missing/non-numeric duration or event values, or negative duration, are excluded.",
+    )
+    render_model_data_audit(km_audit, title="Kaplan–Meier data audit")
     if data.empty:
         st.error("No data remaining after removing missing/invalid survival values.")
         return
@@ -578,6 +586,13 @@ def run_cox_ph(df, duration_col, event_col, covariate_cols, plot_template, strat
     data_raw = data_raw.dropna(subset=extra_cols).copy()
     protected = [duration_col, event_col] + strata_cols
     model_df, encoded_covs = _one_hot_for_lifelines(data_raw, covariate_cols, protected_cols=protected)
+    cox_audit = build_model_data_audit(
+        df,
+        model_df,
+        [duration_col, event_col] + extra_cols,
+        "Rows with invalid survival values or missing selected covariates/strata are excluded before encoding.",
+    )
+    render_model_data_audit(cox_audit, title="Cox model data audit")
 
     if not encoded_covs:
         st.error("No usable covariates after encoding. Select at least one predictor.")
@@ -935,6 +950,13 @@ def run_parametric_aft(df, duration_col, event_col, covariate_cols, plot_templat
     data_raw = data_raw.dropna(subset=covariate_cols).copy()
     protected = [duration_col, event_col]
     model_df, encoded_covs = _one_hot_for_lifelines(data_raw, covariate_cols, protected_cols=protected)
+    aft_audit = build_model_data_audit(
+        df,
+        model_df,
+        [duration_col, event_col] + list(covariate_cols),
+        "Rows with invalid survival values or missing selected covariates are excluded before encoding.",
+    )
+    render_model_data_audit(aft_audit, title="AFT model data audit")
     if not encoded_covs:
         st.error("No usable covariates after encoding.")
         return
@@ -1094,7 +1116,7 @@ def render_survival_tab(df, df_cleaned, plot_template):
         horizontal=True,
         key="surv_dataset",
     )
-    mdf = df_cleaned.copy() if dataset_choice.startswith("Cleaned") else df.copy()
+    mdf = df_cleaned if dataset_choice.startswith("Cleaned") else df
     all_cols = mdf.columns.tolist()
     numeric_cols = mdf.select_dtypes(include=np.number).columns.tolist()
 
